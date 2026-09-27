@@ -3,7 +3,4 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .coverage
-config/camera.json
-config/colors.json
-config/controller.json
 
