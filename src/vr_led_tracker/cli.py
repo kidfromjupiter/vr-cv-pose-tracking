@@ -12,10 +12,10 @@ from .preview import run_preview
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Track a three-sphere VR controller with DroidCam and IMU")
+    parser = argparse.ArgumentParser(description="Track a three-sphere VR controller with a camera and IMU")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    camera = subparsers.add_parser("calibrate-camera", help="Calibrate DroidCam with a checkerboard")
+    camera = subparsers.add_parser("calibrate-camera", help="Calibrate the camera with a checkerboard")
     camera.add_argument("--device", default="/dev/video0")
     camera.add_argument("--output", default="config/camera.json")
     camera.add_argument("--columns", type=int, default=9, help="checkerboard inner corners across")
@@ -43,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
     track.add_argument("--camera", default="config/camera.json")
     track.add_argument("--colors", default="config/colors.json")
     track.add_argument("--max-reprojection-px", type=float, default=5.0)
+    track.add_argument(
+        "--camera-latency-ms",
+        type=float,
+        default=0.0,
+        help="fixed camera delay in milliseconds, from 0 to 500 (default: 0)",
+    )
 
     inertial = subparsers.add_parser(
         "inertial-preview", help="Animate controllers from the timestamped fusion stream"
@@ -72,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "track":
             if args.max_reprojection_px <= 0 or args.baud <= 0:
                 raise TrackerError("--max-reprojection-px and --baud must be positive")
+            if not 0.0 <= args.camera_latency_ms <= 500.0:
+                raise TrackerError("--camera-latency-ms must be between 0 and 500")
             run_preview(
                 args.device,
                 args.serial_device,
@@ -81,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.camera,
                 args.colors,
                 args.max_reprojection_px,
+                args.camera_latency_ms,
             )
         elif args.command == "inertial-preview":
             if args.baud <= 0:

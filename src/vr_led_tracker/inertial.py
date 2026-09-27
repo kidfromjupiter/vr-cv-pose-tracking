@@ -391,37 +391,3 @@ class ErrorStateKalmanFilter:
         self.gravity_camera = np.asarray(state["gravity_camera"]).copy()
         self.covariance = np.asarray(state["covariance"]).copy()
         self.initialized = bool(state["initialized"])
-
-
-class LatencyEstimator:
-    def __init__(self, max_latency_s: float = 0.5, step_s: float = 0.005) -> None:
-        self.max_latency_s = max_latency_s
-        self.step_s = step_s
-
-    def estimate(
-        self,
-        imu_times: np.ndarray,
-        imu_speeds: np.ndarray,
-        camera_times: np.ndarray,
-        camera_speeds: np.ndarray,
-    ) -> tuple[float, float] | None:
-        imu_times = np.asarray(imu_times, dtype=np.float64)
-        imu_speeds = np.asarray(imu_speeds, dtype=np.float64)
-        camera_times = np.asarray(camera_times, dtype=np.float64)
-        camera_speeds = np.asarray(camera_speeds, dtype=np.float64)
-        if len(imu_times) < 20 or len(camera_times) < 10 or np.max(imu_speeds) < math.radians(20):
-            return None
-        best: tuple[float, float] | None = None
-        for latency in np.arange(0.0, self.max_latency_s + self.step_s / 2, self.step_s):
-            query = camera_times - latency
-            valid = (query >= imu_times[0]) & (query <= imu_times[-1])
-            if np.count_nonzero(valid) < 10:
-                continue
-            first = np.interp(query[valid], imu_times, imu_speeds)
-            second = camera_speeds[valid]
-            if np.std(first) < 1e-6 or np.std(second) < 1e-6:
-                continue
-            correlation = float(np.corrcoef(first, second)[0, 1])
-            if best is None or correlation > best[1]:
-                best = (float(latency), correlation)
-        return best

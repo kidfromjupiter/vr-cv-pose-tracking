@@ -35,14 +35,24 @@ def projected_sphere_radius_px(
     center = np.asarray(center_camera_mm, dtype=np.float64).reshape(3)
     radius = diameter_mm * 0.5
     distance = float(np.linalg.norm(center))
-    if distance <= radius or center[2] <= 0:
+    if (
+        not np.isfinite(center).all()
+        or not math.isfinite(radius)
+        or radius <= 0.0
+        or not math.isfinite(distance)
+        or distance <= radius
+        or center[2] <= 0
+    ):
         return float("nan")
     normal = center / distance
     helper = np.array([0.0, 0.0, 1.0])
     if abs(float(np.dot(helper, normal))) > 0.9:
         helper = np.array([0.0, 1.0, 0.0])
     first = np.cross(normal, helper)
-    first /= np.linalg.norm(first)
+    first_norm = float(np.linalg.norm(first))
+    if not math.isfinite(first_norm) or first_norm <= 1e-12:
+        return float("nan")
+    first /= first_norm
     second = np.cross(normal, first)
     silhouette_center = center * (1.0 - (radius * radius) / (distance * distance))
     silhouette_radius = radius * math.sqrt(1.0 - (radius * radius) / (distance * distance))
@@ -50,13 +60,18 @@ def projected_sphere_radius_px(
     circle = silhouette_center + silhouette_radius * (
         np.cos(angles)[:, None] * first + np.sin(angles)[:, None] * second
     )
-    projected, _ = cv2.projectPoints(
-        circle,
-        np.zeros((3, 1)),
-        np.zeros((3, 1)),
-        calibration.camera_matrix,
-        calibration.distortion,
-    )
+    try:
+        projected, _ = cv2.projectPoints(
+            circle,
+            np.zeros((3, 1)),
+            np.zeros((3, 1)),
+            calibration.camera_matrix,
+            calibration.distortion,
+        )
+    except cv2.error:
+        return float("nan")
+    if not np.isfinite(projected).all():
+        return float("nan")
     area = abs(float(cv2.contourArea(projected.reshape(-1, 2).astype(np.float32))))
     return math.sqrt(area / np.pi) if area > 0 else float("nan")
 
@@ -188,35 +203,70 @@ class PoseEstimator:
         indices = [index for index, label in enumerate(self.model.labels) if label in detections]
         if len(indices) < 2:
             return None
-        image_points = np.asarray([detections[self.model.labels[i]].center for i in indices])
-        normalized = cv2.undistortPoints(
-            image_points.reshape(-1, 1, 2),
-            self.calibration.camera_matrix,
-            self.calibration.distortion,
-        ).reshape(-1, 2)
+        rotation = np.asarray(rotation, dtype=np.float64)
+        image_points = np.asarray(
+            [detections[self.model.labels[i]].center for i in indices], dtype=np.float64
+        )
+        if rotation.shape != (3, 3) or not np.isfinite(rotation).all() or not np.isfinite(image_points).all():
+            return None
+        if any(
+            not math.isfinite(detections[self.model.labels[i]].radius)
+            or detections[self.model.labels[i]].radius <= 0.0
+            for i in indices
+        ):
+            return None
+        try:
+            normalized = cv2.undistortPoints(
+                image_points.reshape(-1, 1, 2),
+                self.calibration.camera_matrix,
+                self.calibration.distortion,
+            ).reshape(-1, 2)
+        except cv2.error:
+            return None
+        if not np.isfinite(normalized).all():
+            return None
         bearings = np.column_stack([normalized, np.ones(len(indices))])
-        bearings /= np.linalg.norm(bearings, axis=1, keepdims=True)
+        bearing_norms = np.linalg.norm(bearings, axis=1, keepdims=True)
+        if not np.isfinite(bearing_norms).all() or np.any(bearing_norms <= 1e-12):
+            return None
+        bearings /= bearing_norms
         blocks = []
         targets = []
         for index, bearing in zip(indices, bearings):
             projection = np.eye(3) - np.outer(bearing, bearing)
             blocks.append(projection)
             targets.append(-projection @ (rotation @ self.model.object_points[index]))
-        translation = np.linalg.lstsq(np.vstack(blocks), np.concatenate(targets), rcond=None)[0]
+        design = np.vstack(blocks)
+        target = np.concatenate(targets)
+        translation = self._damped_solve(design, target, 1e-9)
+        if translation is None:
+            return None
         if initial_translation is not None:
-            translation = 0.75 * translation + 0.25 * np.asarray(initial_translation).reshape(3)
+            initial = np.asarray(initial_translation, dtype=np.float64).reshape(3)
+            if not np.isfinite(initial).all():
+                return None
+            translation = 0.75 * translation + 0.25 * initial
 
         for _ in range(8):
             residual = self._translation_residual(indices, detections, rotation, translation)
+            if not np.isfinite(residual).all():
+                return None
             jacobian = np.empty((len(residual), 3), dtype=np.float64)
             for axis in range(3):
                 shifted = translation.copy()
                 shifted[axis] += 0.1
-                jacobian[:, axis] = (
-                    self._translation_residual(indices, detections, rotation, shifted) - residual
-                ) / 0.1
-            step = np.linalg.lstsq(jacobian, -residual, rcond=None)[0]
+                shifted_residual = self._translation_residual(
+                    indices, detections, rotation, shifted
+                )
+                if not np.isfinite(shifted_residual).all():
+                    return None
+                jacobian[:, axis] = (shifted_residual - residual) / 0.1
+            step = self._damped_solve(jacobian, -residual, 1e-3)
+            if step is None:
+                return None
             translation += np.clip(step, -50.0, 50.0)
+            if not np.isfinite(translation).all():
+                return None
             if np.linalg.norm(step) < 1e-3:
                 break
         camera_points = (rotation @ self.model.object_points[indices].T).T + translation
@@ -237,6 +287,32 @@ class PoseEstimator:
         )
         self.last_pose = estimate
         return estimate
+
+    @staticmethod
+    def _damped_solve(
+        matrix: np.ndarray,
+        target: np.ndarray,
+        damping: float,
+    ) -> np.ndarray | None:
+        matrix = np.asarray(matrix, dtype=np.float64)
+        target = np.asarray(target, dtype=np.float64)
+        if (
+            matrix.ndim != 2
+            or target.shape != (matrix.shape[0],)
+            or matrix.shape[1] != 3
+            or not np.isfinite(matrix).all()
+            or not np.isfinite(target).all()
+        ):
+            return None
+        normal = matrix.T @ matrix + np.eye(3) * damping
+        right_hand_side = matrix.T @ target
+        if not np.isfinite(normal).all() or not np.isfinite(right_hand_side).all():
+            return None
+        try:
+            solution = np.linalg.solve(normal, right_hand_side)
+        except np.linalg.LinAlgError:
+            return None
+        return solution if np.isfinite(solution).all() else None
 
     def _translation_residual(
         self,

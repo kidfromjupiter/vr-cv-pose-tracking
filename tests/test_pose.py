@@ -50,6 +50,26 @@ def test_one_sphere_has_no_camera_solution(model, calibration):
     assert PoseEstimator(model, calibration).estimate_translation(detections, np.eye(3)) is None
 
 
+def test_translation_rejects_nonfinite_prediction_without_crashing(model, calibration):
+    rvec = np.array([[0.12], [0.05], [-0.06]])
+    tvec = np.array([[20.0], [12.0], [700.0]])
+    detections = make_detections(model, calibration, rvec, tvec)
+    rotation, _ = cv2.Rodrigues(rvec)
+    assert PoseEstimator(model, calibration).estimate_translation(
+        detections, rotation, np.array([np.nan, 0.0, 700.0])
+    ) is None
+
+
+def test_translation_rejects_nonfinite_detection_without_crashing(model, calibration):
+    rvec = np.zeros((3, 1))
+    tvec = np.array([[0.0], [0.0], [700.0]])
+    detections = make_detections(model, calibration, rvec, tvec)
+    detections[model.labels[0]].center[0] = np.nan
+    assert PoseEstimator(model, calibration).estimate_translation(
+        detections, np.eye(3)
+    ) is None
+
+
 def test_projected_sphere_radius_tracks_depth(calibration):
     near = projected_sphere_radius_px(np.array([0.0, 0.0, 500.0]), 20.0, calibration)
     far = projected_sphere_radius_px(np.array([0.0, 0.0, 1000.0]), 20.0, calibration)

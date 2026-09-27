@@ -14,6 +14,17 @@ def test_color_calibration_collects_more_frames_by_default():
     assert args.samples_per_color == 10
 
 
+def test_tracking_uses_zero_fixed_camera_latency_by_default():
+    args = build_parser().parse_args(["track"])
+    assert args.camera_latency_ms == 0.0
+
+
+def test_tracking_rejects_out_of_range_camera_latency(capsys):
+    assert main(["track", "--camera-latency-ms", "-1"]) == 2
+    assert "--camera-latency-ms must be between 0 and 500" in capsys.readouterr().err
+    assert main(["track", "--camera-latency-ms", "501"]) == 2
+
+
 def test_inertial_preview_rejects_nonpositive_baud(capsys):
     assert main(["inertial-preview", "--baud", "0"]) == 2
     assert "--baud must be positive" in capsys.readouterr().err

@@ -22,7 +22,6 @@ from .serial_pose import FusionFrameParser, FusionSample
 PALETTE = {"red": (20, 20, 245), "blue": (245, 100, 20), "white": (245, 245, 245)}
 STATE_COLORS = {
     "CALIBRATING_STILL": (0, 210, 255),
-    "CALIBRATING_DELAY": (0, 170, 255),
     "FULL": (40, 230, 40),
     "DEGRADED_2": (0, 200, 255),
     "IMU_ONLY": (0, 160, 255),
@@ -104,13 +103,44 @@ def _draw_detections(
 def _draw_pose(frame: np.ndarray, result: FusionResult, calibration: CameraCalibration) -> None:
     if result.pose is None:
         return
-    rvec, _ = cv2.Rodrigues(result.pose.rotation_matrix)
+    rotation = np.asarray(result.pose.rotation_matrix, dtype=np.float64)
+    translation = np.asarray(result.pose.position_m, dtype=np.float64).reshape(3) * 1000.0
+    if rotation.shape != (3, 3) or not np.isfinite(rotation).all() or not np.isfinite(translation).all():
+        return
+    axes = np.array(
+        [[0.0, 0.0, 0.0], [60.0, 0.0, 0.0], [0.0, 60.0, 0.0], [0.0, 0.0, 60.0]],
+        dtype=np.float64,
+    )
+    camera_points = (rotation @ axes.T).T + translation
+    if np.any(camera_points[:, 2] <= 1.0):
+        return
+    try:
+        rvec, _ = cv2.Rodrigues(rotation)
+        projected, _ = cv2.projectPoints(
+            axes,
+            rvec,
+            translation.reshape(3, 1),
+            calibration.camera_matrix,
+            calibration.distortion,
+        )
+    except cv2.error:
+        return
+    projected = projected.reshape(-1, 2)
+    height, width = frame.shape[:2]
+    if (
+        not np.isfinite(projected).all()
+        or np.any(projected[:, 0] < 0.0)
+        or np.any(projected[:, 0] >= width)
+        or np.any(projected[:, 1] < 0.0)
+        or np.any(projected[:, 1] >= height)
+    ):
+        return
     cv2.drawFrameAxes(
         frame,
         calibration.camera_matrix,
         calibration.distortion,
         rvec,
-        result.pose.position_m.reshape(3, 1) * 1000.0,
+        translation.reshape(3, 1),
         60.0,
         2,
     )
@@ -143,6 +173,7 @@ def run_preview(
     camera_path: str,
     colors_path: str,
     full_error_limit_px: float = 5.0,
+    camera_latency_ms: float = 0.0,
 ) -> None:
     model = ControllerModel.load(model_path)
     source_calibration = CameraCalibration.load(camera_path)
@@ -169,7 +200,12 @@ def run_preview(
             height, width = frame.shape[:2]
             if calibration is None:
                 calibration = source_calibration.for_image_size((width, height))
-                tracker = FusionTracker(model, calibration, imu_slot)
+                tracker = FusionTracker(
+                    model,
+                    calibration,
+                    imu_slot,
+                    camera_latency_ms / 1000.0,
+                )
                 tracker.pose_estimator.center_error_limit_px = full_error_limit_px
             assert tracker is not None and calibration is not None
             for sample in serial_reader.drain():
@@ -219,16 +255,13 @@ def run_preview(
                 instant = 1.0 / max(now - previous_frame_time, 1e-6)
                 fps = instant if fps == 0.0 else 0.1 * instant + 0.9 * fps
             previous_frame_time = now
-            latency = "estimating" if result.latency_s is None else f"{result.latency_s * 1000:.0f} ms"
             state_color = STATE_COLORS[result.state]
             lines = [
                 (f"{result.state}  spheres {len(detections)}/3  FPS {fps:.1f}", state_color),
-                (f"DroidCam latency: {latency}", (235, 235, 235)),
+                (f"Camera latency: {result.camera_latency_s * 1000:.0f} ms (fixed)", (235, 235, 235)),
             ]
             if result.state == "CALIBRATING_STILL":
                 lines.append((result.calibration_detail, (0, 210, 255)))
-            elif result.state == "CALIBRATING_DELAY":
-                lines.append((result.calibration_detail, (0, 190, 255)))
             lines.append(("M masks | R recalibrate | Q quit", (210, 210, 210)))
             camera_view = _camera_panel(display_camera, (720, 720))
             _put_lines(camera_view, lines)

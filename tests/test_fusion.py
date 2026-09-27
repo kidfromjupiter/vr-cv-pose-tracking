@@ -4,10 +4,11 @@ import math
 
 import cv2
 import numpy as np
+import pytest
 
 from conftest import make_detections
 from vr_led_tracker.fusion import FusionTracker
-from vr_led_tracker.inertial import ErrorStateKalmanFilter, LatencyEstimator
+from vr_led_tracker.inertial import ErrorStateKalmanFilter
 from vr_led_tracker.serial_pose import FusionSample
 
 
@@ -35,18 +36,6 @@ def test_error_state_filter_cancels_gravity_and_accepts_camera_correction():
     assert corrected.position_m[2] > 0.7
 
 
-def test_latency_estimator_recovers_shifted_motion():
-    imu_times = np.arange(0.0, 5.0, 0.01)
-    imu_speed = 1.2 + np.sin(imu_times * 4.0) + 0.3 * np.sin(imu_times * 9.0)
-    latency = 0.135
-    camera_times = np.arange(0.3, 4.8, 1.0 / 30.0)
-    camera_speed = np.interp(camera_times - latency, imu_times, imu_speed)
-    estimate = LatencyEstimator().estimate(imu_times, imu_speed, camera_times, camera_speed)
-    assert estimate is not None
-    assert estimate[0] == pytest.approx(latency, abs=0.006)
-    assert estimate[1] > 0.99
-
-
 def test_guided_stillness_initializes_fusion(model, calibration):
     tracker = FusionTracker(model, calibration, "right")
     rvec = np.array([[0.0], [0.0], [0.0]])
@@ -58,8 +47,9 @@ def test_guided_stillness_initializes_fusion(model, calibration):
         tracker.add_imu(imu_sample(index * 20000), now)
         result = tracker.process_camera(detections, now)
     assert result is not None
-    assert result.state == "CALIBRATING_DELAY"
+    assert result.state == "FULL"
     assert result.pose is not None
+    assert result.camera_latency_s == 0.0
     np.testing.assert_allclose(result.pose.position_m, tvec.reshape(3) / 1000.0, atol=0.01)
 
 
@@ -79,8 +69,35 @@ def test_guided_stillness_tolerates_imu_yaw_drift(model, calibration):
         result = tracker.process_camera(detections, index * 0.02)
 
     assert result is not None
-    assert result.state == "CALIBRATING_DELAY"
+    assert result.state == "FULL"
     assert result.pose is not None
 
 
-import pytest
+def test_fixed_camera_latency_is_preserved_across_reset(model, calibration):
+    tracker = FusionTracker(model, calibration, "right", camera_latency_s=0.025)
+    tracker.reset()
+    assert tracker.camera_latency_s == 0.025
+    assert tracker.result(0).camera_latency_s == 0.025
+
+
+def test_fixed_camera_latency_offsets_measurement_time(model, calibration):
+    tracker = FusionTracker(model, calibration, "right", camera_latency_s=0.025)
+    tracker.filter.initialize(np.zeros(3), np.eye(3), np.eye(3), np.zeros(3))
+    tracker.latest_arrival_time = 10.0
+    detections = make_detections(
+        model,
+        calibration,
+        np.zeros((3, 1)),
+        np.array([[0.0], [0.0], [750.0]]),
+    )
+    queried_times = []
+
+    def predicted_pose_at(timestamp):
+        queried_times.append(timestamp)
+        return np.eye(3), np.array([0.0, 0.0, 0.75])
+
+    tracker._predicted_pose_at = predicted_pose_at
+    result = tracker.process_camera(detections, 10.0)
+
+    assert result.state == "FULL"
+    assert queried_times == [pytest.approx(9.975)]

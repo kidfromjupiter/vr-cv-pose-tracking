@@ -11,7 +11,6 @@ from .detection import SphereDetection
 from .inertial import (
     ErrorStateKalmanFilter,
     KalmanPose,
-    LatencyEstimator,
     WORLD_GRAVITY_G,
     _rotation_distance,
     wxyz_to_rotation_matrix,
@@ -33,21 +32,26 @@ class FusionResult:
     state: str
     pose: KalmanPose | None
     camera_estimate: PoseEstimate | None
-    latency_s: float | None
-    latency_correlation: float | None
+    camera_latency_s: float
     visible_spheres: int
     calibration_progress: float
     calibration_detail: str
 
 
 class FusionTracker:
-    def __init__(self, model: ControllerModel, calibration: CameraCalibration, slot: str) -> None:
+    def __init__(
+        self,
+        model: ControllerModel,
+        calibration: CameraCalibration,
+        slot: str,
+        camera_latency_s: float = 0.0,
+    ) -> None:
         self.model = model
         self.slot = slot
         self.pose_estimator = PoseEstimator(model, calibration)
         self.filter = ErrorStateKalmanFilter()
         self.timestamp_mapper = TimestampMapper()
-        self.latency_estimator = LatencyEstimator()
+        self.camera_latency_s = float(camera_latency_s)
         self.state = "CALIBRATING_STILL"
         self.latest_sample: FusionSample | None = None
         self.latest_imu_rotation: np.ndarray | None = None
@@ -62,18 +66,17 @@ class FusionTracker:
         self.still_camera_poses: deque[tuple[float, np.ndarray, np.ndarray]] = deque()
         self.calibration_detail = "waiting for camera and IMU data"
         self.history: deque[_HistoryEntry] = deque()
-        self.imu_motion: deque[tuple[float, float]] = deque(maxlen=1500)
-        self.camera_motion: deque[tuple[float, float]] = deque(maxlen=300)
-        self.previous_camera_rotation: np.ndarray | None = None
-        self.previous_camera_time: float | None = None
-        self.latency_s: float | None = None
-        self.latency_correlation: float | None = None
         self.last_camera_update: float | None = None
         self.last_camera_estimate: PoseEstimate | None = None
         self.last_camera_read_time: float | None = None
 
     def reset(self) -> None:
-        fresh = FusionTracker(self.model, self.pose_estimator.calibration, self.slot)
+        fresh = FusionTracker(
+            self.model,
+            self.pose_estimator.calibration,
+            self.slot,
+            self.camera_latency_s,
+        )
         self.__dict__.update(fresh.__dict__)
 
     def add_imu(self, sample: FusionSample, arrival_time: float) -> None:
@@ -89,7 +92,6 @@ class FusionTracker:
                 self.latest_angular_speed = _rotation_distance(
                     rotation, self.previous_imu_rotation
                 ) / dt
-                self.imu_motion.append((timestamp, self.latest_angular_speed))
         self.latest_sample = sample
         self.latest_imu_rotation = rotation
         self.latest_imu_time = timestamp
@@ -135,34 +137,14 @@ class FusionTracker:
         self.last_camera_read_time = read_time
         full = self.pose_estimator.estimate_camera_pose(
             detections,
-            self.filter.rotation if self.filter.initialized and self.latency_s is not None else None,
-            self.filter.position * 1000.0
-            if self.filter.initialized and self.latency_s is not None
-            else None,
+            self.filter.rotation if self.filter.initialized else None,
+            self.filter.position * 1000.0 if self.filter.initialized else None,
         )
         if not self.filter.initialized:
             return self._calibrate_still(full, visible, read_time)
 
-        if full is not None:
-            camera_rotation = self._record_camera_motion(full, read_time)
-        else:
-            camera_rotation = None
-
-        if self.latency_s is None:
-            self._try_estimate_latency()
-            if full is not None:
-                self.filter.update_camera(
-                    full.tvec.reshape(3) / 1000.0,
-                    camera_rotation,
-                    position_sigma_m=0.012,
-                )
-                self.last_camera_update = read_time
-                self.last_camera_estimate = full
-            self.state = "CALIBRATING_DELAY"
-            return self.result(visible)
-
         imu_fresh = self.latest_arrival_time is not None and read_time - self.latest_arrival_time < 0.15
-        measurement_time = read_time - self.latency_s
+        measurement_time = read_time - self.camera_latency_s
         camera_estimate: PoseEstimate | None = None
         if imu_fresh and visible >= 2:
             past_rotation, past_translation = self._predicted_pose_at(measurement_time)
@@ -257,8 +239,8 @@ class FusionTracker:
                     self.filter.export_state(),
                 )
             )
-            self.state = "CALIBRATING_DELAY"
-            self.calibration_detail = "rotate smoothly to measure camera latency"
+            self.state = "FULL"
+            self.calibration_detail = "calibration complete"
         self.last_camera_estimate = full
         return self.result(visible)
 
@@ -267,48 +249,6 @@ class FusionTracker:
         self.bias_samples.clear()
         self.still_camera_poses.clear()
         self.calibration_detail = detail
-
-    def _record_camera_motion(self, estimate: PoseEstimate, timestamp: float) -> np.ndarray:
-        rotation = self._rotation(estimate)
-        if self.previous_camera_rotation is not None and self.previous_camera_time is not None:
-            dt = timestamp - self.previous_camera_time
-            if 0.0 < dt < 0.2:
-                speed = _rotation_distance(rotation, self.previous_camera_rotation) / dt
-                self.camera_motion.append((timestamp, speed))
-        self.previous_camera_rotation = rotation.copy()
-        self.previous_camera_time = timestamp
-        return rotation
-
-    def _try_estimate_latency(self) -> None:
-        if len(self.imu_motion) < 20 or len(self.camera_motion) < 10:
-            self.calibration_detail = (
-                f"collecting motion: IMU {min(len(self.imu_motion), 20)}/20, "
-                f"camera {min(len(self.camera_motion), 10)}/10"
-            )
-            return
-        imu = np.asarray(self.imu_motion)
-        camera = np.asarray(self.camera_motion)
-        peak_speed = math.degrees(float(np.max(imu[:, 1])))
-        if peak_speed < 20.0:
-            self.calibration_detail = (
-                f"rotate faster with varying speed; peak is {peak_speed:.0f} deg/s"
-            )
-            return
-        estimate = self.latency_estimator.estimate(imu[:, 0], imu[:, 1], camera[:, 0], camera[:, 1])
-        if estimate is None:
-            self.calibration_detail = "keep rotating with all three spheres visible"
-            return
-        self.latency_correlation = estimate[1]
-        if estimate[1] >= 0.65:
-            self.latency_s = estimate[0]
-            self.calibration_detail = (
-                f"latency calibrated: {estimate[0] * 1000.0:.0f} ms, "
-                f"correlation {estimate[1]:.2f}"
-            )
-        else:
-            self.calibration_detail = (
-                f"weak motion match {estimate[1]:.2f}/0.65; vary rotation speed"
-            )
 
     def _predicted_pose_at(self, timestamp: float) -> tuple[np.ndarray, np.ndarray]:
         if not self.history:
@@ -356,8 +296,7 @@ class FusionTracker:
             self.state,
             self.filter.snapshot() if self.filter.initialized else None,
             self.last_camera_estimate,
-            self.latency_s,
-            self.latency_correlation,
+            self.camera_latency_s,
             visible,
             progress,
             self.calibration_detail,

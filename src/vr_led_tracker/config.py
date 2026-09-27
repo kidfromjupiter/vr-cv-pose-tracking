@@ -147,7 +147,7 @@ class CameraCalibration:
         if abs(old_aspect - new_aspect) > 0.01:
             raise TrackerError(
                 f"Camera was calibrated at {self.image_size[0]}x{self.image_size[1]}, "
-                f"but DroidCam is {size[0]}x{size[1]} with a different aspect ratio"
+                f"but the camera is {size[0]}x{size[1]} with a different aspect ratio"
             )
         sx = size[0] / self.image_size[0]
         sy = size[1] / self.image_size[1]

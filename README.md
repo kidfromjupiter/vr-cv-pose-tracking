@@ -1,8 +1,9 @@
 # Three-Sphere VR Tracker
 
 A calibrated OpenCV and IMU fusion tracker for one rigid controller carrying
-red, blue, and white spheres. DroidCam provides camera-relative position while
-the ESP32 controller provides timestamped quaternion and acceleration samples.
+red, blue, and white spheres. A low-latency V4L2 stream, such as an adb/scrcpy
+camera feed, provides camera-relative position while the ESP32 controller
+provides timestamped quaternion and acceleration samples.
 An error-state Kalman filter predicts at IMU rate and corrects drift from the
 camera.
 
@@ -30,7 +31,6 @@ files are intentionally unsupported.
 Tracking states:
 
 - `CALIBRATING_STILL`: hold the rig still with all spheres visible.
-- `CALIBRATING_DELAY`: rotate it smoothly to estimate DroidCam latency.
 - `FULL`: three-sphere camera correction plus IMU prediction.
 - `DEGRADED_2`: two-sphere position correction using IMU orientation.
 - `IMU_ONLY`: camera is briefly occluded; prediction is limited to 250 ms.
@@ -61,7 +61,7 @@ Replace every example center and diameter. The sphere edges must be clearly
 visible; exposure-dependent glowing halos do not provide reliable diameter
 measurements.
 
-## 2. Calibrate DroidCam
+## 2. Calibrate the camera
 
 Print `assets/checkerboard-9x6-25mm.svg` at 100% scale and verify its square
 size. Capture tilted views across the full image:
@@ -73,7 +73,7 @@ vr-led-tracker calibrate-camera \
   --output config/camera.json
 ```
 
-Keep DroidCam zoom, orientation, and aspect ratio unchanged afterward.
+Keep the camera zoom, orientation, and aspect ratio unchanged afterward.
 
 ## 3. Calibrate sphere colors
 
@@ -100,21 +100,22 @@ vr-led-tracker track \
   --serial-device /dev/ttyACM0 \
   --baud 230400 \
   --imu-slot right \
+  --camera-latency-ms 0 \
   --model config/controller.json \
   --camera config/camera.json \
   --colors config/colors.json
 ```
 
 At startup, hold the controller still with all three spheres visible for about
-one second. Then rotate it smoothly while keeping the spheres visible. The
-tracker correlates camera and IMU angular motion to estimate DroidCam latency
-over a 0–500 ms range before entering normal tracking.
+one second. Tracking starts immediately after that calibration. Camera delay is
+a fixed value rather than an estimated value; leave `--camera-latency-ms` at
+zero for a low-latency scrcpy stream, or provide a measured value from 0 to 500.
 
-The window shows the annotated DroidCam image and synthetic fused 3D pose side
+The window shows the annotated camera image and synthetic fused 3D pose side
 by side. Controls:
 
 - `M`: show or hide color masks.
-- `R`: discard alignment, latency, and Kalman state and recalibrate.
+- `R`: discard alignment and Kalman state and recalibrate.
 - `Q` or Escape: quit.
 
 For serial-only diagnostics, use:
@@ -129,8 +130,8 @@ vr-led-tracker inertial-preview --device /dev/ttyACM0 --baud 230400
   slot, and close other programs using `/dev/ttyACM0`.
 - **Still calibration restarts:** keep all three spheres visible and prevent
   both translation and rotation for a full second.
-- **Latency calibration does not finish:** make several smooth, distinctive
-  rotations without hiding a sphere.
+- **Camera and IMU motion are offset:** set a measured fixed delay with
+  `--camera-latency-ms`; scrcpy streams should normally start at zero.
 - **White false detections:** reduce reflections and recalibrate colors under
   the intended room lighting.
 - **Wrong depth:** verify camera calibration, physical sphere diameters, and
@@ -145,5 +146,5 @@ pytest
 ```
 
 The suite covers synthetic sphere projection, P3P and two-sphere translation,
-CRC framing, timestamp rollover, Kalman behavior, and latency estimation. Final
-validation still requires the real DroidCam, receiver, IMU, and sphere rig.
+CRC framing, timestamp rollover, fixed-delay replay, and Kalman behavior. Final
+validation still requires the real camera, receiver, IMU, and sphere rig.
