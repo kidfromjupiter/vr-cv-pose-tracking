@@ -1,0 +1,19 @@
+{
+  "spheres": [
+    {
+      "label": "red",
+      "center_mm": [-70.0, 0.0, 0.0],
+      "diameter_mm": 20.0
+    },
+    {
+      "label": "blue",
+      "center_mm": [70.0, 0.0, 0.0],
+      "diameter_mm": 20.0
+    },
+    {
+      "label": "white",
+      "center_mm": [0.0, 45.0, 30.0],
+      "diameter_mm": 20.0
+    }
+  ]
+}
