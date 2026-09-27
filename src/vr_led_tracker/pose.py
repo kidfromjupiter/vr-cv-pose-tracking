@@ -186,10 +186,10 @@ class PoseEstimator:
         if not candidates:
             return None
         estimate = min(candidates, key=lambda item: item[0])[1]
-        if (
-            estimate.reprojection_error_px > self.center_error_limit_px
-            or estimate.radius_error_fraction > self.radius_error_limit
-        ):
+        # Mask area varies substantially with exposure and motion blur. Sphere
+        # radius remains useful for ranking P3P candidates, but must not reject
+        # an otherwise consistent labeled-center solution.
+        if estimate.reprojection_error_px > self.center_error_limit_px:
             return None
         self.last_pose = estimate
         return estimate
@@ -274,7 +274,10 @@ class PoseEstimator:
             return None
         center_error, radius_error = self._metrics(indices, detections, rotation, translation)
         limit = self.center_error_limit_px if len(indices) == 3 else 3.5
-        if center_error > limit or radius_error > self.radius_error_limit:
+        # With a known IMU orientation, labeled center bearings constrain
+        # translation. A partially segmented sphere changes its measured area
+        # but should not invalidate that position measurement.
+        if center_error > limit:
             return None
         rvec, _ = cv2.Rodrigues(rotation)
         estimate = PoseEstimate(
@@ -330,13 +333,7 @@ class PoseEstimator:
             self.calibration.distortion,
         )
         observed = np.asarray([detections[self.model.labels[i]].center for i in indices])
-        residuals = list((projected.reshape(-1, 2) - observed).reshape(-1))
-        for index in indices:
-            predicted = projected_sphere_radius_px(
-                rotation @ self.model.object_points[index] + translation,
-                self.model.diameters_mm[index],
-                self.calibration,
-            )
-            observed_radius = detections[self.model.labels[index]].radius
-            residuals.append(3.0 * (predicted - observed_radius) / max(observed_radius, 1.0))
-        return np.asarray(residuals, dtype=np.float64)
+        return np.asarray(
+            (projected.reshape(-1, 2) - observed).reshape(-1),
+            dtype=np.float64,
+        )

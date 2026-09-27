@@ -146,7 +146,18 @@ class FusionTracker:
         imu_fresh = self.latest_arrival_time is not None and read_time - self.latest_arrival_time < 0.15
         measurement_time = read_time - self.camera_latency_s
         camera_estimate: PoseEstimate | None = None
-        if imu_fresh and visible >= 2:
+        if full is not None and imu_fresh:
+            camera_estimate = full
+            self._delayed_camera_update(
+                measurement_time,
+                full.tvec.reshape(3) / 1000.0,
+                self._rotation(full),
+                0.01,
+            )
+            self.last_camera_update = read_time
+            self.last_camera_estimate = full
+            self.state = "FULL"
+        elif imu_fresh and visible >= 2:
             past_rotation, past_translation = self._predicted_pose_at(measurement_time)
             camera_estimate = self.pose_estimator.estimate_translation(
                 detections,

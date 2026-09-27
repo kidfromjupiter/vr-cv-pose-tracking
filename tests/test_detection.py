@@ -12,6 +12,7 @@ def test_color_profile_handles_hue_wraparound():
     samples = np.array([[178, 240, 250], [179, 245, 255], [0, 250, 250], [2, 235, 245]] * 4)
     profile = profile_from_samples("red", samples)
     assert len(profile.hsv_ranges) == 2
+    assert all(lower[1] <= 180 for lower, _ in profile.hsv_ranges)
 
 
 def test_white_profile_uses_low_saturation_and_high_value():
@@ -20,7 +21,7 @@ def test_white_profile_uses_low_saturation_and_high_value():
     lower, upper = profile.hsv_ranges[0]
     assert lower[0] == 0 and upper[0] == 179
     assert upper[1] <= 150
-    assert lower[2] >= 80
+    assert 80 <= lower[2] <= 190
 
 
 def test_detects_distinct_colored_blobs():

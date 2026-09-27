@@ -90,14 +90,35 @@ def test_fixed_camera_latency_offsets_measurement_time(model, calibration):
         np.zeros((3, 1)),
         np.array([[0.0], [0.0], [750.0]]),
     )
-    queried_times = []
+    correction_times = []
 
-    def predicted_pose_at(timestamp):
-        queried_times.append(timestamp)
-        return np.eye(3), np.array([0.0, 0.0, 0.75])
+    def delayed_camera_update(timestamp, *_args, **_kwargs):
+        correction_times.append(timestamp)
 
-    tracker._predicted_pose_at = predicted_pose_at
+    tracker._delayed_camera_update = delayed_camera_update
     result = tracker.process_camera(detections, 10.0)
 
     assert result.state == "FULL"
-    assert queried_times == [pytest.approx(9.975)]
+    assert correction_times == [pytest.approx(9.975)]
+
+
+def test_three_spheres_use_full_camera_translation_directly(model, calibration):
+    tracker = FusionTracker(model, calibration, "right")
+    tracker.filter.initialize(np.zeros(3), np.eye(3), np.eye(3), np.zeros(3))
+    tracker.latest_arrival_time = 5.0
+    detections = make_detections(
+        model,
+        calibration,
+        np.zeros((3, 1)),
+        np.array([[80.0], [-40.0], [750.0]]),
+    )
+
+    def unexpected_translation_refinement(*_args, **_kwargs):
+        raise AssertionError("three-sphere pose must bypass IMU translation refinement")
+
+    tracker.pose_estimator.estimate_translation = unexpected_translation_refinement
+    result = tracker.process_camera(detections, 5.0)
+
+    assert result.state == "FULL"
+    assert result.pose is not None
+    assert result.pose.position_m[2] > 0.5

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import cv2
 import numpy as np
 import pytest
@@ -38,6 +40,25 @@ def test_two_spheres_use_imu_orientation(model, calibration):
     degraded = estimator.estimate_translation(detections, rotation)
     assert degraded is not None
     assert degraded.state == "DEGRADED_2"
+    np.testing.assert_allclose(degraded.tvec, tvec, atol=1.0)
+
+
+def test_pose_survives_mask_radius_changes(model, calibration):
+    rvec = np.array([[0.12], [0.05], [-0.06]])
+    tvec = np.array([[20.0], [12.0], [700.0]])
+    detections = make_detections(model, calibration, rvec, tvec)
+    detections = {
+        label: replace(detection, radius=detection.radius * 0.35, area=detection.area * 0.1225)
+        for label, detection in detections.items()
+    }
+    estimator = PoseEstimator(model, calibration)
+    full = estimator.estimate_camera_pose(detections)
+    assert full is not None
+
+    detections.pop(model.labels[-1])
+    rotation, _ = cv2.Rodrigues(rvec)
+    degraded = estimator.estimate_translation(detections, rotation)
+    assert degraded is not None
     np.testing.assert_allclose(degraded.tvec, tvec, atol=1.0)
 
 

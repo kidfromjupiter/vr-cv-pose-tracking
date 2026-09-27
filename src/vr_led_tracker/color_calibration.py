@@ -14,7 +14,7 @@ def profile_from_samples(label: str, samples: np.ndarray) -> ColorProfile:
         raise TrackerError(f"Not enough color samples for {label}")
     if label.lower() == "white":
         saturation_high = int(np.clip(np.percentile(samples[:, 1], 90) + 25, 20, 150))
-        value_low = int(np.clip(np.percentile(samples[:, 2], 10) - 35, 80, 255))
+        value_low = int(np.clip(np.percentile(samples[:, 2], 10) - 35, 80, 190))
         return ColorProfile(
             label,
             ((np.array([0, 0, value_low], np.uint8),
@@ -26,8 +26,8 @@ def profile_from_samples(label: str, samples: np.ndarray) -> ColorProfile:
     center = (np.arctan2(np.mean(np.sin(angles)), np.mean(np.cos(angles))) * 180.0 / (2 * np.pi)) % 180
     hue_delta = ((hues - center + 90.0) % 180.0) - 90.0
     margin = float(np.clip(np.percentile(np.abs(hue_delta), 90) + 6.0, 4.0, 30.0))
-    saturation_low = int(np.clip(np.percentile(samples[:, 1], 10) - 35, 0, 255))
-    value_low = int(np.clip(np.percentile(samples[:, 2], 10) - 45, 0, 255))
+    saturation_low = int(np.clip(np.percentile(samples[:, 1], 10) - 35, 0, 180))
+    value_low = int(np.clip(np.percentile(samples[:, 2], 10) - 45, 0, 160))
     lower_hue = center - margin
     upper_hue = center + margin
     ranges: list[tuple[np.ndarray, np.ndarray]] = []
