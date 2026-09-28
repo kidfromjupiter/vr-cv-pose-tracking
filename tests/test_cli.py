@@ -16,15 +16,14 @@ def test_color_calibration_command_is_removed():
         build_parser().parse_args(["calibrate-colors"])
 
 
-def test_tracking_uses_zero_fixed_camera_latency_by_default():
+def test_tracking_uses_hades_settings_by_default():
     args = build_parser().parse_args(["track"])
-    assert args.camera_latency_ms == 0.0
+    assert args.fusion_settings == "config/hades_fusion.json"
 
 
-def test_tracking_rejects_out_of_range_camera_latency(capsys):
-    assert main(["track", "--camera-latency-ms", "-1"]) == 2
-    assert "--camera-latency-ms must be between 0 and 500" in capsys.readouterr().err
-    assert main(["track", "--camera-latency-ms", "501"]) == 2
+def test_tracking_camera_latency_option_is_removed():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["track", "--camera-latency-ms", "25"])
 
 
 def test_inertial_preview_rejects_nonpositive_baud(capsys):

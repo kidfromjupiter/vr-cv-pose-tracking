@@ -3,9 +3,10 @@
 A calibrated OpenCV and IMU fusion tracker for one rigid controller carrying
 three white spheres. A low-latency V4L2 stream, such as an adb/scrcpy camera
 feed, provides camera-relative position while the ESP32 controller provides
-timestamped quaternion and acceleration samples.
-An error-state Kalman filter predicts at IMU rate and corrects drift from the
-camera.
+timestamped quaternion and acceleration samples. Position fusion uses the
+adaptive camera/accelerometer filter structure and defaults from HadesVR.
+Orientation remains on the receiver's IMU quaternion path after a one-time
+camera-to-IMU alignment at startup.
 
 ## Tracking model
 
@@ -33,7 +34,8 @@ Tracking states:
 
 - `CALIBRATING_STILL`: hold the rig still with all spheres visible.
 - `FULL`: three-sphere camera correction plus IMU prediction.
-- `IMU_ONLY`: camera is briefly occluded; prediction is limited to 250 ms.
+- `IMU_ONLY`: the camera is occluded; IMU prediction continues while serial
+  samples remain live.
 - `CAMERA_ONLY`: all spheres are visible but IMU data is stale.
 - `LOST`: neither source can provide a safe pose.
 
@@ -85,15 +87,24 @@ vr-led-tracker track \
   --serial-device /dev/ttyACM0 \
   --baud 230400 \
   --imu-slot right \
-  --camera-latency-ms 0 \
   --model config/controller.json \
-  --camera config/camera.json
+  --camera config/camera.json \
+  --fusion-settings config/hades_fusion.json
 ```
 
 At startup, hold the controller still with all three spheres visible for about
-one second. Tracking starts immediately after that calibration. Camera delay is
-a fixed value rather than an estimated value; leave `--camera-latency-ms` at
-zero for a low-latency scrcpy stream, or provide a measured value from 0 to 500.
+one second. This measures accelerometer bias and the fixed transform between
+the camera and receiver quaternion. Tracking starts immediately afterward.
+Camera measurements are applied when received; there is no camera-latency
+estimation or delayed replay path.
+
+`config/hades_fusion.json` exposes the Hades-style camera and IMU measurement
+uncertainty, estimation uncertainty, process noise, and per-sample velocity
+damping. The defaults are the HadesVR controller values. Its experimental
+camera-velocity yaw correction is also available under
+`yaw_drift_correction`, but is disabled by default. When disabled, optical
+rotation is used only for startup alignment and subsequent orientation comes
+entirely from the receiver quaternion.
 
 White spheres are segmented automatically from low-saturation pixels using an
 adaptive per-frame brightness threshold. The asymmetric model and predicted
@@ -120,8 +131,13 @@ vr-led-tracker inertial-preview --device /dev/ttyACM0 --baud 230400
   slot, and close other programs using `/dev/ttyACM0`.
 - **Still calibration restarts:** keep all three spheres visible and prevent
   both translation and rotation for a full second.
-- **Camera and IMU motion are offset:** set a measured fixed delay with
-  `--camera-latency-ms`; scrcpy streams should normally start at zero.
+- **Position coasts or drifts during occlusion:** this branch deliberately
+  keeps integrating while the IMU is live. Increase damping or reduce IMU
+  process noise in `config/hades_fusion.json`; absolute position is corrected
+  again when all three spheres return.
+- **Yaw slowly drifts:** correct the IMU/magnetometer calibration first. The
+  optional HadesVR camera-velocity yaw correction can be enabled in the fusion
+  settings, but it only operates inside its configured speed range.
 - **White false detections:** avoid bright white background objects and strong
   reflections. The geometric assignment rejects candidates that do not match
   the measured asymmetric rig.
@@ -137,6 +153,15 @@ pytest
 ```
 
 The suite covers adaptive white detection, unordered identity assignment,
-synthetic sphere projection, P3P, CRC framing, timestamp rollover, fixed-delay
-replay, and Kalman behavior. Final validation still requires the real camera,
+synthetic sphere projection, P3P, CRC framing, timestamp rollover, Hades-style
+adaptive fusion, device-timestamp prediction, static optical alignment, and
+camera dropout/reacquisition. Final validation still requires the real camera,
 receiver, IMU, and sphere rig.
+
+## HadesVR attribution
+
+The position filter, tuning defaults, velocity damping, and optional
+camera-velocity yaw correction are adapted from
+[HadesVR at commit 0a6de3c](https://github.com/HadesVR/HadesVR/tree/0a6de3c19e22978dbd2a17e23fcb2e041b0cee48).
+HadesVR is MIT licensed; the required notice is retained in
+`THIRD_PARTY_NOTICES.md`.

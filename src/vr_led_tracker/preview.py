@@ -14,6 +14,7 @@ from .detection import SphereDetection, SphereDetector
 from .errors import TrackerError
 from .filtering import rotation_matrix_to_euler_zyx
 from .fusion import FusionResult, FusionTracker
+from .hades_fusion import HadesFusionSettings
 from .inertial import InertialPose
 from .inertial_preview import _draw_panel
 from .serial_pose import FusionFrameParser, FusionSample
@@ -184,11 +185,12 @@ def run_preview(
     imu_slot: str,
     model_path: str,
     camera_path: str,
+    fusion_settings_path: str,
     full_error_limit_px: float = 5.0,
-    camera_latency_ms: float = 0.0,
 ) -> None:
     model = ControllerModel.load(model_path)
     source_calibration = CameraCalibration.load(camera_path)
+    fusion_settings = HadesFusionSettings.load(fusion_settings_path)
     capture = open_camera(device)
     serial_reader = _SerialReader(serial_device, baud)
     detector = SphereDetector()
@@ -198,7 +200,7 @@ def run_preview(
     fps = 0.0
     previous_frame_time: float | None = None
     show_masks = False
-    window = "Three-sphere camera/IMU tracker"
+    window = "Hades-style three-sphere camera/IMU tracker"
     try:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window, 1440, 720)
@@ -214,7 +216,7 @@ def run_preview(
                     model,
                     calibration,
                     imu_slot,
-                    camera_latency_ms / 1000.0,
+                    fusion_settings,
                 )
                 tracker.pose_estimator.center_error_limit_px = full_error_limit_px
             assert tracker is not None and calibration is not None
@@ -273,8 +275,23 @@ def run_preview(
                     state_color,
                 ),
                 (f"Adaptive white threshold: V >= {white_threshold}", (235, 235, 235)),
-                (f"Camera latency: {result.camera_latency_s * 1000:.0f} ms (fixed)", (235, 235, 235)),
             ]
+            if result.pose is not None:
+                lines.append(
+                    (
+                        f"HADES_FUSION gains camera {np.mean(result.pose.camera_gain):.3f} "
+                        f"IMU {np.mean(result.pose.imu_gain):.3f}",
+                        (235, 235, 235),
+                    )
+                )
+                yaw_state = "on" if fusion_settings.yaw_drift_enabled else "off"
+                lines.append(
+                    (
+                        f"Yaw drift correction {yaw_state}: "
+                        f"{np.degrees(result.pose.yaw_correction_rad):.2f} deg",
+                        (235, 235, 235),
+                    )
+                )
             if result.state == "CALIBRATING_STILL":
                 lines.append((result.calibration_detail, (0, 210, 255)))
             lines.append(("M masks | R recalibrate | Q quit", (210, 210, 210)))

@@ -31,13 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     track.add_argument("--imu-slot", choices=("right", "left"), default="right")
     track.add_argument("--model", default="config/controller.json")
     track.add_argument("--camera", default="config/camera.json")
+    track.add_argument("--fusion-settings", default="config/hades_fusion.json")
     track.add_argument("--max-reprojection-px", type=float, default=5.0)
-    track.add_argument(
-        "--camera-latency-ms",
-        type=float,
-        default=0.0,
-        help="fixed camera delay in milliseconds, from 0 to 500 (default: 0)",
-    )
 
     inertial = subparsers.add_parser(
         "inertial-preview", help="Animate controllers from the timestamped fusion stream"
@@ -58,8 +53,6 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "track":
             if args.max_reprojection_px <= 0 or args.baud <= 0:
                 raise TrackerError("--max-reprojection-px and --baud must be positive")
-            if not 0.0 <= args.camera_latency_ms <= 500.0:
-                raise TrackerError("--camera-latency-ms must be between 0 and 500")
             run_preview(
                 args.device,
                 args.serial_device,
@@ -67,8 +60,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.imu_slot,
                 args.model,
                 args.camera,
+                args.fusion_settings,
                 args.max_reprojection_px,
-                args.camera_latency_ms,
             )
         elif args.command == "inertial-preview":
             if args.baud <= 0:

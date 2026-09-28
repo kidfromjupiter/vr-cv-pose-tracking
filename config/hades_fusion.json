@@ -1,0 +1,21 @@
+{
+  "camera": {
+    "measurement_uncertainty": 2.0,
+    "estimation_uncertainty": 1.0,
+    "process_noise": 7.5
+  },
+  "imu": {
+    "measurement_uncertainty": 2.0,
+    "estimation_uncertainty": 5.0,
+    "process_noise": 22.55
+  },
+  "velocity_damping": 0.9,
+  "yaw_drift_correction": {
+    "enabled": false,
+    "lower_velocity_m_s": 2.0,
+    "upper_velocity_m_s": 5.0,
+    "measurement_uncertainty": 5.0,
+    "estimation_uncertainty": 1.25,
+    "process_noise": 2.0
+  }
+}
