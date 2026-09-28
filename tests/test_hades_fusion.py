@@ -35,6 +35,15 @@ def test_vector_filter_matches_hades_camera_equations():
     )
 
 
+def test_camera_quality_scale_reduces_measurement_gain():
+    normal = HadesVectorFilter(HadesFusionSettings())
+    weak = HadesVectorFilter(HadesFusionSettings())
+    normal.initialize(np.zeros(3)); weak.initialize(np.zeros(3))
+    normal.update_camera(np.ones(3), measurement_scale=1.0)
+    weak.update_camera(np.ones(3), measurement_scale=4.0)
+    assert np.all(weak.camera_gain < normal.camera_gain)
+
+
 def test_vector_filter_accumulates_imu_displacement():
     filter_ = HadesVectorFilter(HadesFusionSettings())
     filter_.initialize(np.array([1.0, 2.0, 3.0]))

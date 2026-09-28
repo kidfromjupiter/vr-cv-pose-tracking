@@ -7,11 +7,11 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .config import CameraCalibration, ControllerModel
+from .config import CameraCalibration, ControllerModel, StereoCalibration
 from .detection import SphereDetection
 from .hades_fusion import HadesFusionSettings, HadesMotionFilter, HadesPose
 from .inertial import WORLD_GRAVITY_G, _rotation_distance, wxyz_to_rotation_matrix
-from .pose import PoseEstimate, PoseEstimator
+from .pose import PoseEstimate, PoseEstimator, StereoPoseEstimator
 from .serial_pose import FusionSample, TimestampMapper
 
 
@@ -114,12 +114,21 @@ class FusionTracker:
             self.filter.position_filter.current_estimate * 1000.0 if prediction_fresh else None,
             frame_time=read_time,
         )
+        return self._process_estimate(estimate, visible, read_time)
+
+    def _process_estimate(
+        self, estimate: PoseEstimate | None, visible: int, read_time: float
+    ) -> FusionResult:
         if not self.filter.initialized:
             return self._calibrate_still(estimate, visible, read_time)
 
         imu_fresh = self.latest_arrival_time is not None and read_time - self.latest_arrival_time < 0.15
         if estimate is not None:
-            self.filter.update_camera(estimate.tvec.reshape(3) / 1000.0, read_time)
+            self.filter.update_camera(
+                estimate.tvec.reshape(3) / 1000.0,
+                read_time,
+                estimate.camera_measurement_scale,
+            )
             self.last_camera_update = read_time
             self.last_camera_estimate = estimate
             self.state = "FULL" if imu_fresh else "CAMERA_ONLY"
@@ -211,3 +220,54 @@ class FusionTracker:
             progress,
             self.calibration_detail,
         )
+
+
+class StereoFusionTracker(FusionTracker):
+    def __init__(
+        self, model: ControllerModel, calibration: StereoCalibration, slot: str,
+        settings: HadesFusionSettings | None = None, max_frame_skew_s: float = 0.02,
+    ) -> None:
+        active_settings = settings or HadesFusionSettings()
+        super().__init__(model, calibration.left, slot, active_settings)
+        self.stereo_calibration = calibration
+        self.max_frame_skew_s = float(max_frame_skew_s)
+        self.pose_estimator = StereoPoseEstimator(
+            model, calibration,
+            epipolar_error_limit_px=active_settings.stereo_epipolar_error_limit_px,
+            rigid_error_limit_mm=active_settings.stereo_rigid_error_limit_mm,
+            min_triangulation_angle_deg=active_settings.stereo_min_triangulation_angle_deg,
+            quality_reference_area_px2=active_settings.stereo_quality_reference_area_px2,
+            quality_reference_angle_deg=active_settings.stereo_quality_reference_angle_deg,
+            max_stereo_measurement_scale=active_settings.stereo_max_measurement_scale,
+            mono_base_measurement_scale=active_settings.stereo_mono_base_measurement_scale,
+            max_mono_measurement_scale=active_settings.stereo_max_mono_measurement_scale,
+            identity_max_speed_px_s=active_settings.identity_max_speed_px_s,
+            identity_reacquire_timeout_s=active_settings.identity_reacquire_timeout_s,
+            allow_mono_fallback=active_settings.stereo_allow_mono_fallback,
+        )
+
+    def reset(self) -> None:
+        error_limit = self.pose_estimator.center_error_limit_px
+        fresh = StereoFusionTracker(
+            self.model, self.stereo_calibration, self.slot, self.settings, self.max_frame_skew_s
+        )
+        fresh.pose_estimator.center_error_limit_px = error_limit
+        fresh.pose_estimator.left_mono.center_error_limit_px = error_limit
+        fresh.pose_estimator.right_mono.center_error_limit_px = error_limit
+        self.__dict__.update(fresh.__dict__)
+
+    def process_stereo(
+        self, left_detections: list[SphereDetection] | None,
+        right_detections: list[SphereDetection] | None, read_time: float,
+        frame_skew_s: float = 0.0,
+    ) -> FusionResult:
+        visible = max(len(left_detections or []), len(right_detections or []))
+        self.last_camera_read_time = read_time
+        fresh = self.filter.initialized and self.last_camera_update is not None and read_time - self.last_camera_update <= 0.25
+        estimate = self.pose_estimator.estimate_camera_pose(
+            left_detections, right_detections,
+            self.filter.rotation if fresh else None,
+            self.filter.position_filter.current_estimate * 1000.0 if fresh else None,
+            read_time, frame_skew_s, self.max_frame_skew_s,
+        )
+        return self._process_estimate(estimate, visible, read_time)

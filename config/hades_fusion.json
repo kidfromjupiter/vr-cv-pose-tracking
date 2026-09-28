@@ -21,5 +21,16 @@
   "identity_tracking": {
     "max_speed_px_s": 6000.0,
     "reacquire_timeout_s": 0.25
+  },
+  "stereo_tracking": {
+    "allow_mono_fallback": true,
+    "epipolar_error_limit_px": 3.0,
+    "rigid_error_limit_mm": 10.0,
+    "min_triangulation_angle_deg": 1.5,
+    "quality_reference_area_px2": 256.0,
+    "quality_reference_angle_deg": 8.0,
+    "max_stereo_measurement_scale": 4.0,
+    "mono_base_measurement_scale": 2.0,
+    "max_mono_measurement_scale": 6.0
   }
 }

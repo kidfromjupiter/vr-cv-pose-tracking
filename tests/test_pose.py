@@ -6,8 +6,8 @@ import cv2
 import numpy as np
 import pytest
 
-from conftest import make_detections
-from vr_led_tracker.pose import PoseEstimator, projected_sphere_radius_px
+from conftest import make_detections, make_stereo_detections
+from vr_led_tracker.pose import PoseEstimator, StereoPoseEstimator, projected_sphere_radius_px
 
 
 def rotation_error_degrees(first, second):
@@ -228,3 +228,60 @@ def test_projected_sphere_radius_tracks_depth(calibration):
     near = projected_sphere_radius_px(np.array([0.0, 0.0, 500.0]), 20.0, calibration)
     far = projected_sphere_radius_px(np.array([0.0, 0.0, 1000.0]), 20.0, calibration)
     assert near == pytest.approx(far * 2.0, rel=0.01)
+
+
+def test_stereo_recovers_unordered_pose(model, stereo_calibration):
+    rvec = np.array([[0.16], [-0.08], [0.05]])
+    tvec = np.array([[30.0], [-15.0], [780.0]])
+    left, right = make_stereo_detections(model, stereo_calibration, rvec, tvec)
+    estimator = StereoPoseEstimator(model, stereo_calibration)
+    estimate = estimator.estimate_camera_pose(
+        list(reversed(list(left.values()))),
+        [right[model.labels[1]], right[model.labels[2]], right[model.labels[0]]],
+        frame_time=1.0, frame_skew_s=.01,
+    )
+    assert estimate is not None and estimate.source == "STEREO"
+    np.testing.assert_allclose(estimate.tvec, tvec, atol=.5)
+    assert rotation_error_degrees(estimate.rvec, rvec) < .1
+    assert 1.0 <= estimate.camera_measurement_scale <= 4.0
+    assert estimate.triangulation_angle_deg > 1.5
+
+
+def test_stereo_right_mono_fallback_is_in_left_frame(model, stereo_calibration):
+    rvec = np.array([[0.1], [0.04], [-0.03]])
+    tvec = np.array([[45.0], [12.0], [720.0]])
+    _, right = make_stereo_detections(model, stereo_calibration, rvec, tvec)
+    estimate = StereoPoseEstimator(model, stereo_calibration).estimate_camera_pose(
+        None, list(reversed(list(right.values()))), frame_time=1.0
+    )
+    assert estimate is not None and estimate.source == "RIGHT_MONO"
+    np.testing.assert_allclose(estimate.tvec, tvec, atol=1.0)
+    assert 2.0 <= estimate.camera_measurement_scale <= 6.0
+
+
+def test_stereo_bad_epipolar_pair_uses_mono_fallback(model, stereo_calibration):
+    rvec, tvec = np.zeros((3, 1)), np.array([[20.0], [5.0], [760.0]])
+    left, right = make_stereo_detections(model, stereo_calibration, rvec, tvec)
+    shifted = {label: replace(d, center=d.center + [0, 30]) for label, d in right.items()}
+    estimate = StereoPoseEstimator(model, stereo_calibration).estimate_camera_pose(
+        list(left.values()), list(shifted.values()), frame_time=1.0
+    )
+    assert estimate is not None and estimate.source != "STEREO"
+
+
+def test_stereo_identity_gate_rejects_impossible_motion(model, stereo_calibration):
+    estimator = StereoPoseEstimator(model, stereo_calibration)
+    first = make_stereo_detections(
+        model, stereo_calibration, np.zeros((3, 1)), np.array([[0.0], [0.0], [740.0]])
+    )
+    jumped = make_stereo_detections(
+        model, stereo_calibration, np.zeros((3, 1)), np.array([[100.0], [0.0], [740.0]])
+    )
+    assert estimator.estimate_camera_pose(
+        list(first[0].values()), list(first[1].values()), frame_time=1.0
+    ) is not None
+    assert estimator.estimate_camera_pose(
+        list(jumped[0].values()), list(jumped[1].values()), frame_time=1.01
+    ) is None
+    assert estimator.left_mono.identity_gate_rejected
+    assert estimator.right_mono.identity_gate_rejected

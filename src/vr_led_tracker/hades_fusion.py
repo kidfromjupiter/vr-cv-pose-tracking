@@ -36,6 +36,15 @@ class HadesFusionSettings:
     yaw_process_noise: float = 2.0
     identity_max_speed_px_s: float = 6000.0
     identity_reacquire_timeout_s: float = 0.25
+    stereo_allow_mono_fallback: bool = True
+    stereo_epipolar_error_limit_px: float = 3.0
+    stereo_rigid_error_limit_mm: float = 10.0
+    stereo_min_triangulation_angle_deg: float = 1.5
+    stereo_quality_reference_area_px2: float = 256.0
+    stereo_quality_reference_angle_deg: float = 8.0
+    stereo_max_measurement_scale: float = 4.0
+    stereo_mono_base_measurement_scale: float = 2.0
+    stereo_max_mono_measurement_scale: float = 6.0
 
     def __post_init__(self) -> None:
         positive = (
@@ -67,6 +76,16 @@ class HadesFusionSettings:
             or self.identity_reacquire_timeout_s <= 0.0
         ):
             raise TrackerError("identity reacquire_timeout_s must be positive")
+        stereo_positive = (
+            self.stereo_epipolar_error_limit_px, self.stereo_rigid_error_limit_mm,
+            self.stereo_min_triangulation_angle_deg, self.stereo_quality_reference_area_px2,
+            self.stereo_quality_reference_angle_deg, self.stereo_max_measurement_scale,
+            self.stereo_mono_base_measurement_scale, self.stereo_max_mono_measurement_scale,
+        )
+        if not all(math.isfinite(value) and value > 0 for value in stereo_positive):
+            raise TrackerError("Stereo tracking limits and quality scales must be positive")
+        if self.stereo_max_measurement_scale < 1.0 or self.stereo_max_mono_measurement_scale < self.stereo_mono_base_measurement_scale:
+            raise TrackerError("Stereo measurement scale limits are invalid")
 
     @classmethod
     def load(cls, path: str | Path) -> "HadesFusionSettings":
@@ -77,6 +96,7 @@ class HadesFusionSettings:
             imu = raw["imu"]
             yaw = raw["yaw_drift_correction"]
             identity = raw.get("identity_tracking", {})
+            stereo = raw.get("stereo_tracking", {})
             return cls(
                 camera_measurement_uncertainty=float(camera["measurement_uncertainty"]),
                 camera_estimation_uncertainty=float(camera["estimation_uncertainty"]),
@@ -95,6 +115,15 @@ class HadesFusionSettings:
                 identity_reacquire_timeout_s=float(
                     identity.get("reacquire_timeout_s", 0.25)
                 ),
+                stereo_allow_mono_fallback=bool(stereo.get("allow_mono_fallback", True)),
+                stereo_epipolar_error_limit_px=float(stereo.get("epipolar_error_limit_px", 3.0)),
+                stereo_rigid_error_limit_mm=float(stereo.get("rigid_error_limit_mm", 10.0)),
+                stereo_min_triangulation_angle_deg=float(stereo.get("min_triangulation_angle_deg", 1.5)),
+                stereo_quality_reference_area_px2=float(stereo.get("quality_reference_area_px2", 256.0)),
+                stereo_quality_reference_angle_deg=float(stereo.get("quality_reference_angle_deg", 8.0)),
+                stereo_max_measurement_scale=float(stereo.get("max_stereo_measurement_scale", 4.0)),
+                stereo_mono_base_measurement_scale=float(stereo.get("mono_base_measurement_scale", 2.0)),
+                stereo_max_mono_measurement_scale=float(stereo.get("max_mono_measurement_scale", 6.0)),
             )
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise TrackerError(f"Cannot load Hades fusion settings {path}: {exc}") from exc
@@ -141,10 +170,10 @@ class HadesVectorFilter:
             self.imu_gain = gain
         return current.copy()
 
-    def update_camera(self, position_m: np.ndarray) -> np.ndarray:
+    def update_camera(self, position_m: np.ndarray, measurement_scale: float = 1.0) -> np.ndarray:
         self.reading = np.asarray(position_m, dtype=np.float64).reshape(3).copy()
         return self._update(
-            self.settings.camera_measurement_uncertainty,
+            self.settings.camera_measurement_uncertainty * max(float(measurement_scale), 1.0),
             self.settings.camera_process_noise,
             "camera",
         )
@@ -289,10 +318,10 @@ class HadesMotionFilter:
             self._update_rotation(self.latest_imu_rotation)
         self.imu_velocity_window.fill(0.0)
 
-    def update_camera(self, position_m: np.ndarray, timestamp: float) -> HadesPose:
+    def update_camera(self, position_m: np.ndarray, timestamp: float, measurement_scale: float = 1.0) -> HadesPose:
         raw_position = np.asarray(position_m, dtype=np.float64).reshape(3)
         previous_estimate = self.position_filter.current_estimate.copy()
-        filtered = self.position_filter.update_camera(raw_position)
+        filtered = self.position_filter.update_camera(raw_position, measurement_scale)
         if (
             self.camera_tracking
             and self.last_camera_time is not None

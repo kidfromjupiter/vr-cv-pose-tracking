@@ -77,6 +77,20 @@ vr-led-tracker calibrate-camera \
 
 Keep the camera zoom, orientation, and aspect ratio unchanged afterward.
 
+For stereo tracking, mount two cameras rigidly with an overlapping view of the
+whole tracking volume, then capture at least 20 checkerboard poses visible in
+both cameras:
+
+```bash
+vr-led-tracker calibrate-stereo \
+  --left-device /dev/video0 --right-device /dev/video2 \
+  --columns 9 --rows 6 --square-mm 25 \
+  --frames 20 --output config/stereo_camera.json
+```
+
+The saved transform maps the left-camera coordinate frame into the right
+camera. The left camera remains the permanent world/tracking frame.
+
 ## 3. Run fused tracking
 
 Close SteamVR and serial monitors, then run:
@@ -98,6 +112,23 @@ the camera and receiver quaternion. Tracking starts immediately afterward.
 Camera measurements are applied when received; there is no camera-latency
 estimation or delayed replay path.
 
+To track with both cameras while keeping the monocular command available, run:
+
+```bash
+vr-led-tracker track-stereo \
+  --left-device /dev/video0 --right-device /dev/video2 \
+  --serial-device /dev/ttyACM0 --imu-slot right \
+  --model config/controller.json \
+  --stereo-camera config/stereo_camera.json \
+  --fusion-settings config/hades_fusion.json
+```
+
+The capture threads pair frames by monotonic receipt time within 20 ms. A
+matched pair uses epipolar correspondence and triangulation; an unmatched or
+geometrically invalid pair can fall back to either camera's monocular P3P
+solution. Right-camera poses are transformed into the left-camera frame before
+fusion. Orientation still follows the IMU quaternion after startup alignment.
+
 `config/hades_fusion.json` exposes the Hades-style camera and IMU measurement
 uncertainty, estimation uncertainty, process noise, and per-sample velocity
 damping. The defaults are the HadesVR controller values. Its experimental
@@ -111,6 +142,13 @@ Each sphere is predicted from its last two accepted image positions. An
 assignment implying more than `max_speed_px_s` for any sphere is rejected; if
 no assignment remains, IMU-only tracking is used until the tracks can be
 continued or `reacquire_timeout_s` expires.
+
+The `stereo_tracking` section controls epipolar, rigid-fit, and minimum
+triangulation-angle gates. Optical confidence is reduced continuously for high
+reprojection error, a narrow triangulation angle, small sphere image area, or
+large frame skew. Mono fallback starts with lower confidence than a sound
+stereo solution. These per-frame confidence values scale the Hades camera
+measurement uncertainty rather than altering the IMU orientation path.
 
 White spheres are segmented automatically from low-saturation pixels using an
 adaptive per-frame brightness threshold. The asymmetric model and predicted
@@ -161,9 +199,10 @@ pytest
 
 The suite covers adaptive white detection, unordered identity assignment,
 synthetic sphere projection, P3P, CRC framing, timestamp rollover, Hades-style
-adaptive fusion, device-timestamp prediction, static optical alignment, and
-camera dropout/reacquisition. Final validation still requires the real camera,
-receiver, IMU, and sphere rig.
+adaptive fusion, stereo synchronization, triangulation, mono fallback,
+confidence-weighted camera gain, device-timestamp prediction, static optical
+alignment, and camera dropout/reacquisition. Final validation still requires
+the real cameras, receiver, IMU, and sphere rig.
 
 ## HadesVR attribution
 

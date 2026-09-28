@@ -21,6 +21,13 @@ def test_tracking_uses_hades_settings_by_default():
     assert args.fusion_settings == "config/hades_fusion.json"
 
 
+def test_stereo_tracking_has_separate_command_and_defaults():
+    args = build_parser().parse_args(["track-stereo"])
+    assert args.left_device == "/dev/video0"
+    assert args.right_device == "/dev/video2"
+    assert args.max_frame_skew_ms == 20.0
+
+
 def test_tracking_camera_latency_option_is_removed():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["track", "--camera-latency-ms", "25"])

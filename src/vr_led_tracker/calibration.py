@@ -5,8 +5,8 @@ import time
 import cv2
 import numpy as np
 
-from .camera import open_camera, read_frame
-from .config import CameraCalibration
+from .camera import StereoCameraCapture, open_camera, read_frame
+from .config import CameraCalibration, StereoCalibration
 from .errors import TrackerError
 
 
@@ -94,6 +94,106 @@ def run_camera_calibration(
         distortion,
         float(rms),
         {"columns": columns, "rows": rows, "square_mm": square_mm, "views": len(image_points)},
+    )
+    calibration.save(output)
+    return calibration
+
+
+def _checkerboard_observation(frame, pattern_size):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    found, corners = cv2.findChessboardCornersSB(
+        gray, pattern_size, flags=cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
+    )
+    display = frame.copy()
+    if not found:
+        return None, display, None
+    cv2.drawChessboardCorners(display, pattern_size, corners, True)
+    points = corners.reshape(-1, 2)
+    height, width = frame.shape[:2]
+    low, high = points.min(axis=0), points.max(axis=0)
+    center = (low + high) / (2.0 * np.array([width, height]))
+    area = np.prod((high - low) / np.array([width, height]))
+    direction = points[pattern_size[0] - 1] - points[0]
+    angle = np.arctan2(direction[1], direction[0]) / np.pi
+    return corners.astype(np.float32), display, np.array([center[0], center[1], area * 2, angle * 0.5])
+
+
+def run_stereo_calibration(
+    left_device: str,
+    right_device: str,
+    output: str,
+    columns: int,
+    rows: int,
+    square_mm: float,
+    required_frames: int = 20,
+    max_frame_skew_ms: float = 20.0,
+) -> StereoCalibration:
+    if columns < 3 or rows < 3 or square_mm <= 0 or required_frames < 10:
+        raise TrackerError("Invalid checkerboard dimensions, square size, or frame count")
+    capture = StereoCameraCapture(left_device, right_device, max_frame_skew_ms / 1000.0)
+    pattern = (columns, rows)
+    object_template = np.zeros((columns * rows, 3), np.float32)
+    object_template[:, :2] = np.mgrid[0:columns, 0:rows].T.reshape(-1, 2) * square_mm
+    objects, left_points, right_points, descriptors = [], [], [], []
+    left_size = right_size = None
+    window = "Stereo camera calibration"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    try:
+        while len(objects) < required_frames:
+            observation = capture.next_observation()
+            if observation.left is None or observation.right is None:
+                continue
+            left_frame, right_frame = observation.left.frame, observation.right.frame
+            left_size = (left_frame.shape[1], left_frame.shape[0])
+            right_size = (right_frame.shape[1], right_frame.shape[0])
+            lc, ld, ldesc = _checkerboard_observation(left_frame, pattern)
+            rc, rd, rdesc = _checkerboard_observation(right_frame, pattern)
+            descriptor = None if ldesc is None or rdesc is None else np.r_[ldesc, rdesc]
+            novel = descriptor is not None and (
+                not descriptors or min(np.linalg.norm(descriptor - old) for old in descriptors) > 0.09
+            )
+            height = min(ld.shape[0], rd.shape[0])
+            panels = [cv2.resize(item, None, fx=height/item.shape[0], fy=height/item.shape[0]) for item in (ld, rd)]
+            display = np.hstack(panels)
+            _draw_text(display, [
+                f"Accepted stereo views: {len(objects)}/{required_frames}",
+                f"Frame skew: {(observation.skew_s or 0) * 1000:.1f} ms",
+                "Move and tilt the board through both views",
+                "SPACE capture | Q cancel",
+                "Ready" if novel else ("Try a new viewpoint" if descriptor is not None else "Board needed in both views"),
+            ])
+            cv2.imshow(window, display)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                raise TrackerError("Stereo calibration cancelled")
+            if key == ord(" ") and novel:
+                objects.append(object_template.copy())
+                left_points.append(lc)
+                right_points.append(rc)
+                descriptors.append(descriptor)
+                time.sleep(0.08)
+    finally:
+        capture.close()
+        cv2.destroyWindow(window)
+    if left_size is None or right_size is None:
+        raise TrackerError("No stereo calibration frames were captured")
+    if left_size != right_size:
+        raise TrackerError(
+            "Stereo calibration requires both cameras to use the same image resolution"
+        )
+    left_rms, left_matrix, left_dist, _, _ = cv2.calibrateCamera(objects, left_points, left_size, None, None)
+    right_rms, right_matrix, right_dist, _, _ = cv2.calibrateCamera(objects, right_points, right_size, None, None)
+    result = cv2.stereoCalibrate(
+        objects, left_points, right_points, left_matrix, left_dist, right_matrix, right_dist,
+        left_size, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-7),
+        flags=cv2.CALIB_FIX_INTRINSIC,
+    )
+    stereo_rms, left_matrix, left_dist, right_matrix, right_dist, rotation, translation = result[:7]
+    board = {"columns": columns, "rows": rows, "square_mm": square_mm, "views": len(objects)}
+    calibration = StereoCalibration(
+        CameraCalibration(left_size, left_matrix, left_dist, float(left_rms), board),
+        CameraCalibration(right_size, right_matrix, right_dist, float(right_rms), board),
+        rotation, translation.reshape(3), float(stereo_rms), board,
     )
     calibration.save(output)
     return calibration

@@ -8,7 +8,7 @@ from itertools import combinations, permutations
 import cv2
 import numpy as np
 
-from .config import CameraCalibration, ControllerModel
+from .config import CameraCalibration, ControllerModel, StereoCalibration
 from .detection import SphereDetection
 
 
@@ -20,6 +20,9 @@ class PoseEstimate:
     radius_error_fraction: float
     state: str
     visible_spheres: int
+    source: str = "MONOCULAR"
+    camera_measurement_scale: float = 1.0
+    triangulation_angle_deg: float | None = None
 
 
 def _rotation_distance(first: np.ndarray, second: np.ndarray) -> float:
@@ -385,3 +388,197 @@ class PoseEstimator:
                 )
             )
         return candidates
+
+
+def _skew(vector: np.ndarray) -> np.ndarray:
+    x, y, z = np.asarray(vector, dtype=np.float64).reshape(3)
+    return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+
+
+def _rigid_transform(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    source_center, target_center = np.mean(source, axis=0), np.mean(target, axis=0)
+    covariance = (source - source_center).T @ (target - target_center)
+    left, _, right = np.linalg.svd(covariance)
+    rotation = right.T @ left.T
+    if np.linalg.det(rotation) < 0.0:
+        right[-1] *= -1.0
+        rotation = right.T @ left.T
+    return rotation, target_center - rotation @ source_center
+
+
+class StereoPoseEstimator:
+    """Triangulate three sphere centers and express the pose in the left-camera frame."""
+
+    def __init__(
+        self, model: ControllerModel, calibration: StereoCalibration,
+        center_error_limit_px: float = 5.0, epipolar_error_limit_px: float = 3.0,
+        rigid_error_limit_mm: float = 10.0, min_triangulation_angle_deg: float = 1.5,
+        quality_reference_area_px2: float = 256.0, quality_reference_angle_deg: float = 8.0,
+        max_stereo_measurement_scale: float = 4.0, mono_base_measurement_scale: float = 2.0,
+        max_mono_measurement_scale: float = 6.0, identity_max_speed_px_s: float = 6000.0,
+        identity_reacquire_timeout_s: float = 0.25, allow_mono_fallback: bool = True,
+    ) -> None:
+        self.model, self.calibration = model, calibration
+        self.center_error_limit_px = float(center_error_limit_px)
+        self.epipolar_error_limit_px = float(epipolar_error_limit_px)
+        self.rigid_error_limit_mm = float(rigid_error_limit_mm)
+        self.min_triangulation_angle_deg = float(min_triangulation_angle_deg)
+        self.quality_reference_area_px2 = float(quality_reference_area_px2)
+        self.quality_reference_angle_deg = float(quality_reference_angle_deg)
+        self.max_stereo_measurement_scale = float(max_stereo_measurement_scale)
+        self.mono_base_measurement_scale = float(mono_base_measurement_scale)
+        self.max_mono_measurement_scale = float(max_mono_measurement_scale)
+        self.allow_mono_fallback = bool(allow_mono_fallback)
+        mono_args = (identity_max_speed_px_s, identity_reacquire_timeout_s)
+        self.left_mono = PoseEstimator(model, calibration.left, center_error_limit_px, 0.35, *mono_args)
+        self.right_mono = PoseEstimator(model, calibration.right, center_error_limit_px, 0.35, *mono_args)
+        self.last_pose: PoseEstimate | None = None
+        self.last_left_assignment: dict[str, SphereDetection] = {}
+        self.last_right_assignment: dict[str, SphereDetection] = {}
+        essential = _skew(calibration.right_from_left_translation_mm) @ calibration.right_from_left_rotation
+        self.fundamental = np.linalg.inv(calibration.right.camera_matrix).T @ essential @ np.linalg.inv(calibration.left.camera_matrix)
+
+    def reset(self) -> None:
+        self.left_mono.reset(); self.right_mono.reset()
+        self.last_pose = None; self.last_left_assignment.clear(); self.last_right_assignment.clear()
+
+    @staticmethod
+    def _valid(detections: list[SphereDetection] | None) -> list[SphereDetection]:
+        return [] if detections is None else [d for d in detections[:8] if np.asarray(d.center).shape == (2,) and np.isfinite(d.center).all()]
+
+    def _undistorted(self, detections, calibration, pixels=True):
+        points = np.asarray([d.center for d in detections], dtype=np.float64).reshape(-1, 1, 2)
+        return cv2.undistortPoints(points, calibration.camera_matrix, calibration.distortion,
+                                   P=calibration.camera_matrix if pixels else None).reshape(-1, 2)
+
+    def _edges(self, left, right):
+        lp, rp = self._undistorted(left, self.calibration.left), self._undistorted(right, self.calibration.right)
+        edges = []
+        for li, point_l in enumerate(lp):
+            line_r = self.fundamental @ np.r_[point_l, 1.0]
+            for ri, point_r in enumerate(rp):
+                hr = np.r_[point_r, 1.0]; line_l = self.fundamental.T @ hr
+                numerator = abs(float(hr @ line_r))
+                denominators = (np.linalg.norm(line_r[:2]), np.linalg.norm(line_l[:2]))
+                if min(denominators) <= 1e-12: continue
+                error = 0.5 * numerator * (1.0 / denominators[0] + 1.0 / denominators[1])
+                if error <= self.epipolar_error_limit_px: edges.append((error, li, ri))
+        return edges
+
+    def _triangulate(self, left, right, matching):
+        ln = self._undistorted([left[e[1]] for e in matching], self.calibration.left, False)
+        rn = self._undistorted([right[e[2]] for e in matching], self.calibration.right, False)
+        p1 = np.hstack([np.eye(3), np.zeros((3, 1))])
+        p2 = np.hstack([self.calibration.right_from_left_rotation,
+                        self.calibration.right_from_left_translation_mm.reshape(3, 1)])
+        homogeneous = cv2.triangulatePoints(p1, p2, ln.T, rn.T)
+        if np.any(np.abs(homogeneous[3]) <= 1e-9): return None
+        points = (homogeneous[:3] / homogeneous[3]).T
+        right_points = (self.calibration.right_from_left_rotation @ points.T).T + self.calibration.right_from_left_translation_mm
+        if not np.isfinite(points).all() or np.any(points[:, 2] <= 100) or np.any(points[:, 2] >= 5000) or np.any(right_points[:, 2] <= 100) or np.any(right_points[:, 2] >= 5000):
+            return None
+        camera_right = -self.calibration.right_from_left_rotation.T @ self.calibration.right_from_left_translation_mm
+        angles = []
+        for point in points:
+            ray_l = point / np.linalg.norm(point); ray_r = (point - camera_right) / np.linalg.norm(point - camera_right)
+            angles.append(math.degrees(math.acos(np.clip(float(ray_l @ ray_r), -1, 1))))
+        return points, min(angles)
+
+    def _metrics(self, rotation, translation, la, ra):
+        rr = self.calibration.right_from_left_rotation @ rotation
+        rt = self.calibration.right_from_left_rotation @ translation + self.calibration.right_from_left_translation_mm
+        lrvec = cv2.Rodrigues(rotation)[0]; rrvec = cv2.Rodrigues(rr)[0]
+        lp = cv2.projectPoints(self.model.object_points, lrvec, translation, self.calibration.left.camera_matrix, self.calibration.left.distortion)[0].reshape(-1, 2)
+        rp = cv2.projectPoints(self.model.object_points, rrvec, rt, self.calibration.right.camera_matrix, self.calibration.right.distortion)[0].reshape(-1, 2)
+        observed_l = np.asarray([la[label].center for label in self.model.labels])
+        observed_r = np.asarray([ra[label].center for label in self.model.labels])
+        center_error = float(np.sqrt(np.mean(np.sum(np.vstack([lp-observed_l, rp-observed_r]) ** 2, axis=1))))
+        radius_errors = []
+        for i, sphere in enumerate(self.model.spheres):
+            for center, detection, cal in ((rotation @ sphere.center_mm + translation, la[sphere.label], self.calibration.left), (rr @ sphere.center_mm + rt, ra[sphere.label], self.calibration.right)):
+                radius = projected_sphere_radius_px(center, sphere.diameter_mm, cal)
+                if not np.isfinite(radius) or detection.radius <= 0: return center_error, float("inf")
+                radius_errors.append(abs(radius-detection.radius)/detection.radius)
+        return center_error, float(np.mean(radius_errors))
+
+    def _quality(self, reprojection, angle, assignments, frame_skew_s, max_frame_skew_s, mono=False):
+        reproj = 1.0 + (reprojection / max(self.center_error_limit_px, 1e-6)) ** 2
+        mean_area = max(float(np.mean([d.area for a in assignments for d in a.values()])), 1e-6)
+        area = max(1.0, math.sqrt(self.quality_reference_area_px2 / mean_area))
+        if mono: return min(self.max_mono_measurement_scale, self.mono_base_measurement_scale * reproj * area)
+        angle_factor = max(1.0, math.sin(math.radians(self.quality_reference_angle_deg)) / max(math.sin(math.radians(angle)), 1e-6))
+        skew = 1.0 + max(frame_skew_s, 0.0) / max(max_frame_skew_s, 1e-6)
+        return min(self.max_stereo_measurement_scale, reproj * area * angle_factor * skew)
+
+    def _estimate_stereo(self, left, right, predicted_rotation, predicted_translation, frame_time, frame_skew_s, max_frame_skew_s):
+        matchings = [m for m in combinations(self._edges(left, right), 3) if len({x[1] for x in m}) == 3 and len({x[2] for x in m}) == 3]
+        matchings.sort(key=lambda m: sum(x[0] for x in m))
+        candidates = []
+        for matching in matchings[:256]:
+            result = self._triangulate(left, right, matching)
+            if result is None: continue
+            points, angle = result
+            if angle < self.min_triangulation_angle_deg: continue
+            for order in permutations(range(3)):
+                source = self.model.object_points[list(order)]
+                try: rotation, translation = _rigid_transform(source, points)
+                except np.linalg.LinAlgError: continue
+                rigid = float(np.sqrt(np.mean(np.sum(((rotation @ source.T).T + translation - points) ** 2, axis=1))))
+                if not np.isfinite(rigid) or rigid > self.rigid_error_limit_mm: continue
+                la = {self.model.labels[mi]: left[matching[pi][1]] for pi, mi in enumerate(order)}
+                ra = {self.model.labels[mi]: right[matching[pi][2]] for pi, mi in enumerate(order)}
+                reproj, radius = self._metrics(rotation, translation, la, ra)
+                if not np.isfinite(reproj) or reproj > self.center_error_limit_px or radius > 0.35: continue
+                score = reproj + rigid + 12*radius - sum(d.score for d in la.values()) - sum(d.score for d in ra.values())
+                if predicted_rotation is not None: score += 2*math.degrees(_rotation_distance(rotation, predicted_rotation))
+                if predicted_translation is not None: score += .01*float(np.linalg.norm(translation-predicted_translation))
+                scale = self._quality(reproj, angle, (la, ra), frame_skew_s, max_frame_skew_s)
+                estimate = PoseEstimate(cv2.Rodrigues(rotation)[0], translation.reshape(3,1), reproj, radius, "FULL", 3, "STEREO", scale, angle)
+                candidates.append((score, estimate, la, ra))
+        if not candidates: return None
+        left_allowed, left_scores = self.left_mono._temporal_assignment_scores([x[2] for x in candidates], frame_time)
+        right_allowed, right_scores = self.right_mono._temporal_assignment_scores([x[3] for x in candidates], frame_time)
+        left_keys = {tuple(id(a[l]) for l in self.model.labels) for a in left_allowed}
+        right_keys = {tuple(id(a[l]) for l in self.model.labels) for a in right_allowed}
+        plausible = []
+        for item in candidates:
+            lk = tuple(id(item[2][l]) for l in self.model.labels); rk = tuple(id(item[3][l]) for l in self.model.labels)
+            if lk in left_keys and rk in right_keys: plausible.append((item[0] + .25*left_scores.get(lk,0) + .25*right_scores.get(rk,0), *item[1:]))
+        if not plausible: return None
+        _, estimate, la, ra = min(plausible, key=lambda x: x[0])
+        self.last_pose = estimate; self.last_left_assignment = dict(la); self.last_right_assignment = dict(ra)
+        self.left_mono.last_pose = estimate; self.left_mono.last_assignment = dict(la); self.left_mono._record_assignment(frame_time, la)
+        right_rotation = self.calibration.right_from_left_rotation @ cv2.Rodrigues(estimate.rvec)[0]
+        right_translation = self.calibration.right_from_left_rotation @ estimate.tvec.reshape(3) + self.calibration.right_from_left_translation_mm
+        self.right_mono.last_pose = PoseEstimate(cv2.Rodrigues(right_rotation)[0], right_translation.reshape(3,1), estimate.reprojection_error_px, estimate.radius_error_fraction, "FULL", 3)
+        self.right_mono.last_assignment = dict(ra); self.right_mono._record_assignment(frame_time, ra)
+        return estimate
+
+    def estimate_camera_pose(self, left_detections, right_detections, predicted_rotation=None, predicted_translation=None, frame_time=None, frame_skew_s=0.0, max_frame_skew_s=0.02):
+        left, right = self._valid(left_detections), self._valid(right_detections)
+        if len(left) >= 3 and len(right) >= 3:
+            estimate = self._estimate_stereo(left, right, predicted_rotation, predicted_translation, frame_time, frame_skew_s, max_frame_skew_s)
+            if estimate is not None: return estimate
+        if not self.allow_mono_fallback: return None
+        choices = []
+        if len(left) >= 3:
+            e = self.left_mono.estimate_camera_pose(left, predicted_rotation, predicted_translation, frame_time)
+            if e is not None:
+                scale = self._quality(e.reprojection_error_px, 0, (self.left_mono.last_assignment,), 0, 1, True)
+                choices.append((e.reprojection_error_px+12*e.radius_error_fraction, PoseEstimate(e.rvec,e.tvec,e.reprojection_error_px,e.radius_error_fraction,e.state,e.visible_spheres,"LEFT_MONO",scale)))
+        if len(right) >= 3:
+            rp = None if predicted_rotation is None else self.calibration.right_from_left_rotation @ predicted_rotation
+            tp = None if predicted_translation is None else self.calibration.right_from_left_rotation @ predicted_translation + self.calibration.right_from_left_translation_mm
+            e = self.right_mono.estimate_camera_pose(right, rp, tp, frame_time)
+            if e is not None:
+                rr = cv2.Rodrigues(e.rvec)[0]; lr = self.calibration.right_from_left_rotation.T @ rr
+                lt = self.calibration.right_from_left_rotation.T @ (e.tvec.reshape(3)-self.calibration.right_from_left_translation_mm)
+                scale = self._quality(e.reprojection_error_px, 0, (self.right_mono.last_assignment,), 0, 1, True)
+                choices.append((e.reprojection_error_px+12*e.radius_error_fraction+1e-9, PoseEstimate(cv2.Rodrigues(lr)[0],lt.reshape(3,1),e.reprojection_error_px,e.radius_error_fraction,e.state,e.visible_spheres,"RIGHT_MONO",scale)))
+        if not choices:
+            self.last_left_assignment.clear(); self.last_right_assignment.clear(); return None
+        estimate = min(choices, key=lambda x:x[0])[1]
+        self.last_left_assignment = dict(self.left_mono.last_assignment) if len(left) >= 3 else {}
+        self.last_right_assignment = dict(self.right_mono.last_assignment) if len(right) >= 3 else {}
+        self.last_pose = estimate
+        return estimate
