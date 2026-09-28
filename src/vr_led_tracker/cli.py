@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .calibration import run_camera_calibration
+from .calibration import run_camera_calibration, run_stereo_calibration
 from .config import ControllerModel
 from .errors import TrackerError
 from .inertial_preview import run_inertial_preview
@@ -12,7 +12,7 @@ from .preview import run_preview
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Track a three-white-sphere VR controller with a camera and IMU"
+        description="Track a three-white-sphere VR controller with stereo cameras and an IMU"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -24,14 +24,28 @@ def build_parser() -> argparse.ArgumentParser:
     camera.add_argument("--square-mm", type=float, required=True, help="measured checker square size")
     camera.add_argument("--frames", type=int, default=15)
 
+    stereo = subparsers.add_parser(
+        "calibrate-stereo", help="Calibrate two cameras with synchronized checkerboard views"
+    )
+    stereo.add_argument("--left-device", default="/dev/video0")
+    stereo.add_argument("--right-device", default="/dev/video2")
+    stereo.add_argument("--output", default="config/stereo_camera.json")
+    stereo.add_argument("--columns", type=int, default=9, help="checkerboard inner corners across")
+    stereo.add_argument("--rows", type=int, default=6, help="checkerboard inner corners down")
+    stereo.add_argument("--square-mm", type=float, required=True, help="measured checker square size")
+    stereo.add_argument("--frames", type=int, default=20)
+    stereo.add_argument("--max-frame-skew-ms", type=float, default=20.0)
+
     track = subparsers.add_parser("track", help="Open the fused camera/IMU pose preview")
-    track.add_argument("--device", default="/dev/video0")
+    track.add_argument("--left-device", default="/dev/video0")
+    track.add_argument("--right-device", default="/dev/video2")
     track.add_argument("--serial-device", default="/dev/ttyACM0")
     track.add_argument("--baud", type=int, default=230400)
     track.add_argument("--imu-slot", choices=("right", "left"), default="right")
     track.add_argument("--model", default="config/controller.json")
-    track.add_argument("--camera", default="config/camera.json")
+    track.add_argument("--stereo-camera", default="config/stereo_camera.json")
     track.add_argument("--max-reprojection-px", type=float, default=5.0)
+    track.add_argument("--max-frame-skew-ms", type=float, default=20.0)
     track.add_argument(
         "--camera-latency-ms",
         type=float,
@@ -55,20 +69,45 @@ def main(argv: list[str] | None = None) -> int:
                 args.device, args.output, args.columns, args.rows, args.square_mm, args.frames
             )
             print(f"Saved {args.output}; RMS reprojection error {calibration.rms_error:.4f} px")
+        elif args.command == "calibrate-stereo":
+            if args.left_device == args.right_device:
+                raise TrackerError("--left-device and --right-device must be different")
+            if not 1.0 <= args.max_frame_skew_ms <= 100.0:
+                raise TrackerError("--max-frame-skew-ms must be between 1 and 100")
+            calibration = run_stereo_calibration(
+                args.left_device,
+                args.right_device,
+                args.output,
+                args.columns,
+                args.rows,
+                args.square_mm,
+                args.frames,
+                args.max_frame_skew_ms,
+            )
+            print(
+                f"Saved {args.output}; stereo RMS reprojection error "
+                f"{calibration.rms_error:.4f} px"
+            )
         elif args.command == "track":
             if args.max_reprojection_px <= 0 or args.baud <= 0:
                 raise TrackerError("--max-reprojection-px and --baud must be positive")
             if not 0.0 <= args.camera_latency_ms <= 500.0:
                 raise TrackerError("--camera-latency-ms must be between 0 and 500")
+            if args.left_device == args.right_device:
+                raise TrackerError("--left-device and --right-device must be different")
+            if not 1.0 <= args.max_frame_skew_ms <= 100.0:
+                raise TrackerError("--max-frame-skew-ms must be between 1 and 100")
             run_preview(
-                args.device,
+                args.left_device,
+                args.right_device,
                 args.serial_device,
                 args.baud,
                 args.imu_slot,
                 args.model,
-                args.camera,
+                args.stereo_camera,
                 args.max_reprojection_px,
                 args.camera_latency_ms,
+                args.max_frame_skew_ms,
             )
         elif args.command == "inertial-preview":
             if args.baud <= 0:

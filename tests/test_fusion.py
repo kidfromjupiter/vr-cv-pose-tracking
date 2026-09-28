@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import pytest
 
-from conftest import make_detections
+from conftest import make_detections, make_stereo_detections
 from vr_led_tracker.fusion import FusionTracker
 from vr_led_tracker.inertial import ErrorStateKalmanFilter
 from vr_led_tracker.serial_pose import FusionSample
@@ -95,8 +95,10 @@ def test_guided_stillness_tolerates_imu_yaw_drift(model, calibration):
 
 def test_fixed_camera_latency_is_preserved_across_reset(model, calibration):
     tracker = FusionTracker(model, calibration, "right", camera_latency_s=0.025)
+    tracker.pose_estimator.center_error_limit_px = 7.0
     tracker.reset()
     assert tracker.camera_latency_s == 0.025
+    assert tracker.pose_estimator.center_error_limit_px == 7.0
     assert tracker.result(0).camera_latency_s == 0.025
 
 
@@ -142,3 +144,40 @@ def test_three_spheres_use_full_camera_translation_directly(model, calibration):
     assert result.state == "FULL"
     assert result.pose is not None
     assert result.pose.position_m[2] > 0.5
+
+
+def test_stereo_measurement_initializes_fusion(model, stereo_calibration):
+    tracker = FusionTracker(model, stereo_calibration, "right")
+    rvec = np.zeros((3, 1))
+    tvec = np.array([[20.0], [-10.0], [750.0]])
+    left, right = make_stereo_detections(model, stereo_calibration, rvec, tvec)
+
+    result = None
+    for index in range(70):
+        now = index * 0.02
+        tracker.add_imu(imu_sample(index * 20000), now)
+        result = tracker.process_stereo(list(left.values()), list(right.values()), now)
+
+    assert result is not None
+    assert result.state == "FULL"
+    assert result.camera_mode == "STEREO"
+    assert result.left_visible_spheres == 3
+    assert result.right_visible_spheres == 3
+    np.testing.assert_allclose(result.pose.position_m, tvec.reshape(3) / 1000.0, atol=0.01)
+
+
+def test_stereo_tracker_uses_left_monocular_fallback(model, stereo_calibration):
+    tracker = FusionTracker(model, stereo_calibration, "right")
+    tracker.filter.initialize(np.zeros(3), np.eye(3), np.eye(3), np.zeros(3))
+    tracker.latest_arrival_time = 4.0
+    left, _ = make_stereo_detections(
+        model,
+        stereo_calibration,
+        np.zeros((3, 1)),
+        np.array([[30.0], [0.0], [740.0]]),
+    )
+
+    result = tracker.process_stereo(list(left.values()), None, 4.0)
+
+    assert result.state == "FULL"
+    assert result.camera_mode == "LEFT_MONO"

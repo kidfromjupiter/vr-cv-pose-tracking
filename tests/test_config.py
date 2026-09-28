@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from vr_led_tracker.config import CameraCalibration, ControllerModel
+from vr_led_tracker.config import CameraCalibration, ControllerModel, StereoCalibration
 from vr_led_tracker.errors import TrackerError
 
 
@@ -68,3 +68,29 @@ def test_rejects_symmetric_white_sphere_geometry(tmp_path):
     )
     with pytest.raises(TrackerError, match="too symmetric"):
         ControllerModel.load(path)
+
+
+def test_stereo_calibration_round_trip_and_scaling(tmp_path, stereo_calibration):
+    path = tmp_path / "stereo.json"
+    stereo_calibration.save(path)
+
+    loaded = StereoCalibration.load(path)
+    np.testing.assert_allclose(loaded.right_from_left_rotation, np.eye(3))
+    np.testing.assert_allclose(loaded.right_from_left_translation_mm, [-120.0, 0.0, 0.0])
+    scaled = loaded.for_image_sizes((640, 360), (640, 360))
+    assert scaled.left.camera_matrix[0, 0] == pytest.approx(450.0)
+    assert scaled.right.camera_matrix[1, 2] == pytest.approx(180.0)
+
+
+def test_stereo_calibration_rejects_invalid_transform(calibration):
+    with pytest.raises(TrackerError, match="proper orthonormal"):
+        StereoCalibration(
+            calibration,
+            calibration,
+            np.diag([1.0, 1.0, 2.0]),
+            np.array([-120.0, 0.0, 0.0]),
+            0.2,
+            {},
+        )
+    with pytest.raises(TrackerError, match="baseline"):
+        StereoCalibration(calibration, calibration, np.eye(3), np.zeros(3), 0.2, {})

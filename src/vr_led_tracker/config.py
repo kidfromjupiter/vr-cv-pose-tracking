@@ -115,21 +115,20 @@ class CameraCalibration:
     rms_error: float
     board: dict[str, float | int]
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "image_size": list(self.image_size),
+            "camera_matrix": self.camera_matrix.tolist(),
+            "distortion": self.distortion.reshape(-1).tolist(),
+            "rms_error": self.rms_error,
+            "board": self.board,
+        }
+
     def save(self, path: str | Path) -> None:
-        _write_json(
-            path,
-            {
-                "image_size": list(self.image_size),
-                "camera_matrix": self.camera_matrix.tolist(),
-                "distortion": self.distortion.reshape(-1).tolist(),
-                "rms_error": self.rms_error,
-                "board": self.board,
-            },
-        )
+        _write_json(path, self.to_dict())
 
     @classmethod
-    def load(cls, path: str | Path) -> "CameraCalibration":
-        raw = _read_json(path)
+    def from_dict(cls, raw: dict[str, Any], description: str) -> "CameraCalibration":
         try:
             size = tuple(int(v) for v in raw["image_size"])
             matrix = np.asarray(raw["camera_matrix"], dtype=np.float64)
@@ -137,12 +136,22 @@ class CameraCalibration:
             rms = float(raw["rms_error"])
             board = dict(raw.get("board", {}))
         except (KeyError, TypeError, ValueError) as exc:
-            raise TrackerError(f"Invalid camera calibration file {path}") from exc
+            raise TrackerError(f"Invalid camera calibration {description}") from exc
         if len(size) != 2 or min(size) <= 0 or matrix.shape != (3, 3):
-            raise TrackerError(f"Invalid camera calibration dimensions in {path}")
-        if distortion.size < 4 or not np.isfinite(matrix).all() or not np.isfinite(distortion).all():
-            raise TrackerError(f"Invalid camera calibration values in {path}")
+            raise TrackerError(f"Invalid camera calibration dimensions in {description}")
+        if (
+            distortion.size < 4
+            or not np.isfinite(matrix).all()
+            or not np.isfinite(distortion).all()
+            or not np.isfinite(rms)
+        ):
+            raise TrackerError(f"Invalid camera calibration values in {description}")
         return cls((size[0], size[1]), matrix, distortion, rms, board)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "CameraCalibration":
+        raw = _read_json(path)
+        return cls.from_dict(raw, f"file {path}")
 
     def for_image_size(self, size: tuple[int, int]) -> "CameraCalibration":
         if size == self.image_size:
@@ -161,3 +170,73 @@ class CameraCalibration:
         matrix[1, :] *= sy
         matrix[2, 2] = 1.0
         return CameraCalibration(size, matrix, self.distortion.copy(), self.rms_error, self.board)
+
+
+@dataclass(frozen=True)
+class StereoCalibration:
+    left: CameraCalibration
+    right: CameraCalibration
+    right_from_left_rotation: np.ndarray
+    right_from_left_translation_mm: np.ndarray
+    rms_error: float
+    board: dict[str, float | int]
+
+    def __post_init__(self) -> None:
+        rotation = np.asarray(self.right_from_left_rotation, dtype=np.float64)
+        translation = np.asarray(self.right_from_left_translation_mm, dtype=np.float64).reshape(-1)
+        if rotation.shape != (3, 3) or translation.shape != (3,):
+            raise TrackerError("Stereo transform must contain a 3x3 rotation and 3-vector translation")
+        if not np.isfinite(rotation).all() or not np.isfinite(translation).all():
+            raise TrackerError("Stereo transform contains non-finite values")
+        if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-4) or not np.isclose(
+            np.linalg.det(rotation), 1.0, atol=1e-4
+        ):
+            raise TrackerError("Stereo rotation must be a proper orthonormal rotation")
+        if float(np.linalg.norm(translation)) < 1.0:
+            raise TrackerError("Stereo camera baseline must be at least 1 mm")
+        if not np.isfinite(self.rms_error) or self.rms_error < 0.0:
+            raise TrackerError("Stereo RMS error must be finite and non-negative")
+        object.__setattr__(self, "right_from_left_rotation", rotation.copy())
+        object.__setattr__(self, "right_from_left_translation_mm", translation.copy())
+
+    def save(self, path: str | Path) -> None:
+        _write_json(
+            path,
+            {
+                "left": self.left.to_dict(),
+                "right": self.right.to_dict(),
+                "right_from_left": {
+                    "rotation": self.right_from_left_rotation.tolist(),
+                    "translation_mm": self.right_from_left_translation_mm.tolist(),
+                },
+                "stereo_rms_error": self.rms_error,
+                "board": self.board,
+            },
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> "StereoCalibration":
+        raw = _read_json(path)
+        try:
+            transform = raw["right_from_left"]
+            left = CameraCalibration.from_dict(raw["left"], f"left camera in {path}")
+            right = CameraCalibration.from_dict(raw["right"], f"right camera in {path}")
+            rotation = np.asarray(transform["rotation"], dtype=np.float64)
+            translation = np.asarray(transform["translation_mm"], dtype=np.float64)
+            rms = float(raw["stereo_rms_error"])
+            board = dict(raw.get("board", {}))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TrackerError(f"Invalid stereo calibration file {path}") from exc
+        return cls(left, right, rotation, translation, rms, board)
+
+    def for_image_sizes(
+        self, left_size: tuple[int, int], right_size: tuple[int, int]
+    ) -> "StereoCalibration":
+        return StereoCalibration(
+            self.left.for_image_size(left_size),
+            self.right.for_image_size(right_size),
+            self.right_from_left_rotation,
+            self.right_from_left_translation_mm,
+            self.rms_error,
+            self.board,
+        )

@@ -8,8 +8,8 @@ from collections import deque
 import cv2
 import numpy as np
 
-from .camera import open_camera, read_frame
-from .config import CameraCalibration, ControllerModel
+from .camera import StereoCameraCapture
+from .config import CameraCalibration, ControllerModel, StereoCalibration
 from .detection import SphereDetection, SphereDetector
 from .errors import TrackerError
 from .filtering import rotation_matrix_to_euler_zyx
@@ -113,11 +113,23 @@ def _draw_detections(
         )
 
 
-def _draw_pose(frame: np.ndarray, result: FusionResult, calibration: CameraCalibration) -> None:
+def _draw_pose(
+    frame: np.ndarray,
+    result: FusionResult,
+    calibration: CameraCalibration,
+    camera_from_left_rotation: np.ndarray | None = None,
+    camera_from_left_translation_mm: np.ndarray | None = None,
+) -> None:
     if result.pose is None:
         return
     rotation = np.asarray(result.pose.rotation_matrix, dtype=np.float64)
     translation = np.asarray(result.pose.position_m, dtype=np.float64).reshape(3) * 1000.0
+    if camera_from_left_rotation is not None and camera_from_left_translation_mm is not None:
+        transform_rotation = np.asarray(camera_from_left_rotation, dtype=np.float64)
+        rotation = transform_rotation @ rotation
+        translation = transform_rotation @ translation + np.asarray(
+            camera_from_left_translation_mm, dtype=np.float64
+        ).reshape(3)
     if rotation.shape != (3, 3) or not np.isfinite(rotation).all() or not np.isfinite(translation).all():
         return
     axes = np.array(
@@ -178,38 +190,68 @@ def _put_lines(frame: np.ndarray, lines: list[tuple[str, tuple[int, int, int]]])
 
 
 def run_preview(
-    device: str,
+    left_device: str,
+    right_device: str,
     serial_device: str,
     baud: int,
     imu_slot: str,
     model_path: str,
-    camera_path: str,
+    stereo_camera_path: str,
     full_error_limit_px: float = 5.0,
     camera_latency_ms: float = 0.0,
+    max_frame_skew_ms: float = 20.0,
 ) -> None:
     model = ControllerModel.load(model_path)
-    source_calibration = CameraCalibration.load(camera_path)
-    capture = open_camera(device)
-    serial_reader = _SerialReader(serial_device, baud)
-    detector = SphereDetector()
-    calibration: CameraCalibration | None = None
+    source_calibration = StereoCalibration.load(stereo_camera_path)
+    capture = StereoCameraCapture(left_device, right_device, max_frame_skew_ms / 1000.0)
+    try:
+        serial_reader = _SerialReader(serial_device, baud)
+    except Exception:
+        capture.close()
+        raise
+    detectors = {"left": SphereDetector(), "right": SphereDetector()}
+    calibration: StereoCalibration | None = None
     tracker: FusionTracker | None = None
     trail: deque[np.ndarray] = deque(maxlen=180)
     fps = 0.0
     previous_frame_time: float | None = None
     show_masks = False
-    window = "Three-sphere camera/IMU tracker"
+    window = "Stereo three-sphere camera/IMU tracker"
+    latest_frames: dict[str, np.ndarray | None] = {"left": None, "right": None}
+    latest_candidates: dict[str, list[SphereDetection]] = {"left": [], "right": []}
+    latest_masks: dict[str, np.ndarray | None] = {"left": None, "right": None}
+    latest_thresholds = {"left": 0, "right": 0}
     try:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window, 1440, 720)
+        cv2.resizeWindow(window, 1920, 640)
         while True:
-            frame = read_frame(capture)
+            observation = capture.next_observation(0.5)
             now = time.monotonic()
             if serial_reader.error is not None:
                 raise TrackerError(f"Cannot read serial device {serial_device}: {serial_reader.error}")
-            height, width = frame.shape[:2]
+            current_detections: dict[str, list[SphereDetection] | None] = {
+                "left": None,
+                "right": None,
+            }
+            for side, packet in (("left", observation.left), ("right", observation.right)):
+                if packet is None:
+                    continue
+                latest_frames[side] = packet.frame
+                candidates, mask, threshold = detectors[side].detect(packet.frame)
+                latest_candidates[side] = candidates
+                latest_masks[side] = mask
+                latest_thresholds[side] = threshold
+                current_detections[side] = candidates
+            if latest_frames["left"] is None or latest_frames["right"] is None:
+                continue
             if calibration is None:
-                calibration = source_calibration.for_image_size((width, height))
+                left_frame = latest_frames["left"]
+                right_frame = latest_frames["right"]
+                assert left_frame is not None and right_frame is not None
+                calibration = source_calibration.for_image_sizes(
+                    (left_frame.shape[1], left_frame.shape[0]),
+                    (right_frame.shape[1], right_frame.shape[0]),
+                )
                 tracker = FusionTracker(
                     model,
                     calibration,
@@ -221,12 +263,28 @@ def run_preview(
             for sample in serial_reader.drain():
                 tracker.add_imu(sample, sample.arrival_time or now)
 
-            candidates, mask, white_threshold = detector.detect(frame)
-            result = tracker.process_camera(candidates, now)
-            assignment = tracker.pose_estimator.last_assignment
-            display_camera = frame.copy()
-            _draw_detections(display_camera, candidates, assignment)
-            _draw_pose(display_camera, result, calibration)
+            result = tracker.process_stereo(
+                current_detections["left"],
+                current_detections["right"],
+                observation.timestamp,
+            )
+            left_assignment = tracker.pose_estimator.last_left_assignment
+            right_assignment = tracker.pose_estimator.last_right_assignment
+            left_frame = latest_frames["left"]
+            right_frame = latest_frames["right"]
+            assert left_frame is not None and right_frame is not None
+            left_display = left_frame.copy()
+            right_display = right_frame.copy()
+            _draw_detections(left_display, latest_candidates["left"], left_assignment)
+            _draw_detections(right_display, latest_candidates["right"], right_assignment)
+            _draw_pose(left_display, result, calibration.left)
+            _draw_pose(
+                right_display,
+                result,
+                calibration.right,
+                calibration.right_from_left_rotation,
+                calibration.right_from_left_translation_mm,
+            )
 
             if result.pose is not None:
                 if not trail or np.linalg.norm(trail[-1] - result.pose.position_m) > 0.002:
@@ -255,7 +313,7 @@ def run_preview(
                 inertial_pose,
                 (80, 210, 255),
                 trail,
-                (720, 720),
+                (640, 640),
                 model.object_points / 1000.0,
                 model.diameters_mm / 1000.0,
                 tuple([(245, 245, 245)] * len(model.spheres)),
@@ -268,33 +326,48 @@ def run_preview(
             state_color = STATE_COLORS[result.state]
             lines = [
                 (
-                    f"{result.state}  assigned {len(assignment)}/3  "
-                    f"candidates {len(candidates)}  FPS {fps:.1f}",
+                    f"{result.state}  {result.camera_mode}  "
+                    f"candidates L{result.left_visible_spheres}/R{result.right_visible_spheres}  FPS {fps:.1f}",
                     state_color,
                 ),
-                (f"Adaptive white threshold: V >= {white_threshold}", (235, 235, 235)),
+                (
+                    f"White threshold: L>={latest_thresholds['left']} R>={latest_thresholds['right']}",
+                    (235, 235, 235),
+                ),
+                (
+                    "Frame skew: mono fallback"
+                    if observation.skew_s is None
+                    else f"Frame skew: {observation.skew_s * 1000.0:.1f} ms",
+                    (235, 235, 235),
+                ),
                 (f"Camera latency: {result.camera_latency_s * 1000:.0f} ms (fixed)", (235, 235, 235)),
             ]
             if result.state == "CALIBRATING_STILL":
                 lines.append((result.calibration_detail, (0, 210, 255)))
             lines.append(("M masks | R recalibrate | Q quit", (210, 210, 210)))
-            camera_view = _camera_panel(display_camera, (720, 720))
-            _put_lines(camera_view, lines)
-            display = np.hstack([camera_view, synthetic])
+            left_view = _camera_panel(left_display, (640, 640))
+            right_view = _camera_panel(right_display, (640, 640))
+            _put_lines(left_view, lines)
+            cv2.putText(right_view, "RIGHT", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (235, 235, 235), 2)
+            display = np.hstack([left_view, right_view, synthetic])
             cv2.imshow(window, display)
             if show_masks:
-                cv2.imshow("White sphere mask", mask)
+                if latest_masks["left"] is not None:
+                    cv2.imshow("Left white sphere mask", latest_masks["left"])
+                if latest_masks["right"] is not None:
+                    cv2.imshow("Right white sphere mask", latest_masks["right"])
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
                 break
             if key == ord("m"):
                 show_masks = not show_masks
                 if not show_masks:
-                    cv2.destroyWindow("White sphere mask")
+                    cv2.destroyWindow("Left white sphere mask")
+                    cv2.destroyWindow("Right white sphere mask")
             elif key == ord("r"):
                 tracker.reset()
                 trail.clear()
     finally:
-        capture.release()
+        capture.close()
         serial_reader.close()
         cv2.destroyAllWindows()

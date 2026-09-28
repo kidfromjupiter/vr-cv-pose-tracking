@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .config import CameraCalibration, ControllerModel
+from .config import CameraCalibration, ControllerModel, StereoCalibration
 from .detection import SphereDetection
 from .inertial import (
     ErrorStateKalmanFilter,
@@ -15,7 +15,7 @@ from .inertial import (
     _rotation_distance,
     wxyz_to_rotation_matrix,
 )
-from .pose import PoseEstimate, PoseEstimator
+from .pose import PoseEstimate, PoseEstimator, StereoPoseEstimator
 from .serial_pose import FusionSample, TimestampMapper
 
 
@@ -36,19 +36,27 @@ class FusionResult:
     visible_spheres: int
     calibration_progress: float
     calibration_detail: str
+    camera_mode: str = "NONE"
+    left_visible_spheres: int = 0
+    right_visible_spheres: int = 0
 
 
 class FusionTracker:
     def __init__(
         self,
         model: ControllerModel,
-        calibration: CameraCalibration,
+        calibration: CameraCalibration | StereoCalibration,
         slot: str,
         camera_latency_s: float = 0.0,
     ) -> None:
         self.model = model
         self.slot = slot
-        self.pose_estimator = PoseEstimator(model, calibration)
+        self.calibration = calibration
+        self.pose_estimator: PoseEstimator | StereoPoseEstimator
+        if isinstance(calibration, StereoCalibration):
+            self.pose_estimator = StereoPoseEstimator(model, calibration)
+        else:
+            self.pose_estimator = PoseEstimator(model, calibration)
         self.filter = ErrorStateKalmanFilter()
         self.timestamp_mapper = TimestampMapper()
         self.camera_latency_s = float(camera_latency_s)
@@ -69,14 +77,19 @@ class FusionTracker:
         self.last_camera_update: float | None = None
         self.last_camera_estimate: PoseEstimate | None = None
         self.last_camera_read_time: float | None = None
+        self.camera_mode = "NONE"
+        self.left_visible_spheres = 0
+        self.right_visible_spheres = 0
 
     def reset(self) -> None:
+        center_error_limit_px = self.pose_estimator.center_error_limit_px
         fresh = FusionTracker(
             self.model,
-            self.pose_estimator.calibration,
+            self.calibration,
             self.slot,
             self.camera_latency_s,
         )
+        fresh.pose_estimator.center_error_limit_px = center_error_limit_px
         self.__dict__.update(fresh.__dict__)
 
     def add_imu(self, sample: FusionSample, arrival_time: float) -> None:
@@ -134,6 +147,34 @@ class FusionTracker:
         read_time: float,
     ) -> FusionResult:
         visible = len(detections)
+        self.left_visible_spheres = visible
+        self.right_visible_spheres = 0
+        self.last_camera_read_time = read_time
+        prediction_fresh = (
+            self.filter.initialized
+            and self.last_camera_update is not None
+            and read_time - self.last_camera_update <= 0.25
+        )
+        if not isinstance(self.pose_estimator, PoseEstimator):
+            raise TypeError("process_camera is only available with a single-camera calibration")
+        full = self.pose_estimator.estimate_camera_pose(
+            detections,
+            self.filter.rotation if prediction_fresh else None,
+            self.filter.position * 1000.0 if prediction_fresh else None,
+        )
+        return self._consume_camera_estimate(full, visible, read_time)
+
+    def process_stereo(
+        self,
+        left_detections: list[SphereDetection] | None,
+        right_detections: list[SphereDetection] | None,
+        read_time: float,
+    ) -> FusionResult:
+        if not isinstance(self.pose_estimator, StereoPoseEstimator):
+            raise TypeError("process_stereo requires a stereo calibration")
+        self.left_visible_spheres = 0 if left_detections is None else len(left_detections)
+        self.right_visible_spheres = 0 if right_detections is None else len(right_detections)
+        visible = max(self.left_visible_spheres, self.right_visible_spheres)
         self.last_camera_read_time = read_time
         prediction_fresh = (
             self.filter.initialized
@@ -141,23 +182,31 @@ class FusionTracker:
             and read_time - self.last_camera_update <= 0.25
         )
         full = self.pose_estimator.estimate_camera_pose(
-            detections,
+            left_detections,
+            right_detections,
             self.filter.rotation if prediction_fresh else None,
             self.filter.position * 1000.0 if prediction_fresh else None,
         )
+        return self._consume_camera_estimate(full, visible, read_time)
+
+    def _consume_camera_estimate(
+        self, full: PoseEstimate | None, visible: int, read_time: float
+    ) -> FusionResult:
+        self.camera_mode = "NONE" if full is None else full.source
         if not self.filter.initialized:
             return self._calibrate_still(full, visible, read_time)
 
         imu_fresh = self.latest_arrival_time is not None and read_time - self.latest_arrival_time < 0.15
         measurement_time = read_time - self.camera_latency_s
         camera_estimate: PoseEstimate | None = None
+        position_sigma_m = 0.006 if full is not None and full.source == "STEREO" else 0.01
         if full is not None and imu_fresh:
             camera_estimate = full
             self._delayed_camera_update(
                 measurement_time,
                 full.tvec.reshape(3) / 1000.0,
                 self._rotation(full),
-                0.01,
+                position_sigma_m,
             )
             self.last_camera_update = read_time
             self.last_camera_estimate = full
@@ -166,7 +215,7 @@ class FusionTracker:
             self.filter.update_camera(
                 full.tvec.reshape(3) / 1000.0,
                 self._rotation(full),
-                position_sigma_m=0.018,
+                position_sigma_m=position_sigma_m,
                 orientation_sigma_deg=5.0,
             )
             self.last_camera_update = read_time
@@ -291,4 +340,7 @@ class FusionTracker:
             visible,
             progress,
             self.calibration_detail,
+            self.camera_mode,
+            self.left_visible_spheres,
+            self.right_visible_spheres,
         )

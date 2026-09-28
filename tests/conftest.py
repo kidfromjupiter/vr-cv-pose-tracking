@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import pytest
 
-from vr_led_tracker.config import CameraCalibration, ControllerModel
+from vr_led_tracker.config import CameraCalibration, ControllerModel, StereoCalibration
 
 
 @pytest.fixture
@@ -41,6 +41,18 @@ def calibration() -> CameraCalibration:
     )
 
 
+@pytest.fixture
+def stereo_calibration(calibration) -> StereoCalibration:
+    return StereoCalibration(
+        calibration,
+        calibration,
+        np.eye(3),
+        np.array([-120.0, 0.0, 0.0]),
+        0.25,
+        {},
+    )
+
+
 def make_detections(model, calibration, rvec, tvec):
     from vr_led_tracker.detection import SphereDetection
     from vr_led_tracker.pose import projected_sphere_radius_px
@@ -58,3 +70,21 @@ def make_detections(model, calibration, rvec, tvec):
             sphere.label, point, radius, np.pi * radius**2, 0.9, 1.0, contour
         )
     return values
+
+
+def make_stereo_detections(model, calibration, rvec, tvec):
+    left = make_detections(model, calibration.left, rvec, tvec)
+    rotation, _ = cv2.Rodrigues(rvec)
+    right_rotation = calibration.right_from_left_rotation @ rotation
+    right_translation = (
+        calibration.right_from_left_rotation @ np.asarray(tvec).reshape(3)
+        + calibration.right_from_left_translation_mm
+    )
+    right_rvec, _ = cv2.Rodrigues(right_rotation)
+    right = make_detections(
+        model,
+        calibration.right,
+        right_rvec,
+        right_translation.reshape(3, 1),
+    )
+    return left, right

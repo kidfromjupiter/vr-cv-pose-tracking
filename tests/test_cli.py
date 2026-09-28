@@ -19,6 +19,9 @@ def test_color_calibration_command_is_removed():
 def test_tracking_uses_zero_fixed_camera_latency_by_default():
     args = build_parser().parse_args(["track"])
     assert args.camera_latency_ms == 0.0
+    assert args.left_device == "/dev/video0"
+    assert args.right_device == "/dev/video2"
+    assert args.max_frame_skew_ms == 20.0
 
 
 def test_tracking_rejects_out_of_range_camera_latency(capsys):
@@ -30,3 +33,16 @@ def test_tracking_rejects_out_of_range_camera_latency(capsys):
 def test_inertial_preview_rejects_nonpositive_baud(capsys):
     assert main(["inertial-preview", "--baud", "0"]) == 2
     assert "--baud must be positive" in capsys.readouterr().err
+
+
+def test_tracking_rejects_same_camera_and_invalid_skew(capsys):
+    assert main(["track", "--left-device", "2", "--right-device", "2"]) == 2
+    assert "must be different" in capsys.readouterr().err
+    assert main(["track", "--max-frame-skew-ms", "0"]) == 2
+    assert "--max-frame-skew-ms must be between 1 and 100" in capsys.readouterr().err
+
+
+def test_stereo_calibration_defaults():
+    args = build_parser().parse_args(["calibrate-stereo", "--square-mm", "25"])
+    assert args.frames == 20
+    assert args.output == "config/stereo_camera.json"
