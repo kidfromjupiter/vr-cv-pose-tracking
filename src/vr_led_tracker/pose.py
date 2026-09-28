@@ -136,7 +136,9 @@ class PoseEstimator:
         predicted_rotation: np.ndarray | None = None,
         predicted_translation: np.ndarray | None = None,
     ) -> PoseEstimate | None:
+        previous_assignment = dict(self.last_assignment)
         self.last_assignment = {}
+        projected_prediction: np.ndarray | None = None
         if isinstance(detections, dict):
             assignments = [detections]
         else:
@@ -163,6 +165,7 @@ class PoseEstimator:
                 except (ValueError, cv2.error):
                     projected = np.empty((0, 2))
                 if projected.shape == (3, 2) and np.isfinite(projected).all():
+                    projected_prediction = projected
                     ranked = sorted(
                         assignments,
                         key=lambda assignment: sum(
@@ -191,6 +194,21 @@ class PoseEstimator:
             ):
                 detection_quality = sum(item.score for item in assignment.values())
                 total = score - 2.0 * detection_quality
+                if projected_prediction is not None:
+                    total += 0.12 * sum(
+                        float(np.linalg.norm(assignment[label].center - point))
+                        for label, point in zip(self.model.labels, projected_prediction)
+                    )
+                if all(label in previous_assignment for label in self.model.labels):
+                    total += 0.08 * sum(
+                        float(
+                            np.linalg.norm(
+                                assignment[label].center
+                                - previous_assignment[label].center
+                            )
+                        )
+                        for label in self.model.labels
+                    )
                 if best is None or total < best[0]:
                     best = (total, estimate, assignment)
         if best is None:

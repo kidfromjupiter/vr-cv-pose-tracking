@@ -98,6 +98,32 @@ def test_white_distractor_is_not_assigned_with_pose_prediction(model, calibratio
     np.testing.assert_allclose(estimate.tvec, tvec, atol=1.0)
 
 
+def test_identity_assignment_stays_stable_between_frames(model, calibration):
+    first_rvec = np.array([[0.08], [-0.04], [0.03]])
+    first_tvec = np.array([[10.0], [-5.0], [740.0]])
+    second_rvec = np.array([[0.09], [-0.035], [0.035]])
+    second_tvec = np.array([[14.0], [-3.0], [738.0]])
+    first = make_detections(model, calibration, first_rvec, first_tvec)
+    second = make_detections(model, calibration, second_rvec, second_tvec)
+    second_rotation, _ = cv2.Rodrigues(second_rvec)
+    estimator = PoseEstimator(model, calibration)
+
+    assert estimator.estimate_camera_pose(list(reversed(list(first.values())))) is not None
+    estimate = estimator.estimate_camera_pose(
+        [second[model.labels[1]], second[model.labels[2]], second[model.labels[0]]],
+        second_rotation,
+        second_tvec.reshape(3),
+    )
+
+    assert estimate is not None
+    for label in model.labels:
+        np.testing.assert_allclose(
+            estimator.last_assignment[label].center,
+            second[label].center,
+            atol=0.01,
+        )
+
+
 def test_projected_sphere_radius_tracks_depth(calibration):
     near = projected_sphere_radius_px(np.array([0.0, 0.0, 500.0]), 20.0, calibration)
     far = projected_sphere_radius_px(np.array([0.0, 0.0, 1000.0]), 20.0, calibration)
