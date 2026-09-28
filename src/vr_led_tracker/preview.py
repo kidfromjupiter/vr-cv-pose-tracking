@@ -294,6 +294,13 @@ def run_preview(
                 )
             if result.state == "CALIBRATING_STILL":
                 lines.append((result.calibration_detail, (0, 210, 255)))
+            if tracker.pose_estimator.identity_gate_detail:
+                gate_color = (
+                    (40, 40, 255)
+                    if tracker.pose_estimator.identity_gate_rejected
+                    else (0, 210, 255)
+                )
+                lines.append((tracker.pose_estimator.identity_gate_detail, gate_color))
             lines.append(("M masks | R recalibrate | Q quit", (210, 210, 210)))
             camera_view = _camera_panel(display_camera, (720, 720))
             _put_lines(camera_view, lines)

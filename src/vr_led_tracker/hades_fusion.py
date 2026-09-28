@@ -34,6 +34,8 @@ class HadesFusionSettings:
     yaw_measurement_uncertainty: float = 5.0
     yaw_estimation_uncertainty: float = 1.25
     yaw_process_noise: float = 2.0
+    identity_max_speed_px_s: float = 6000.0
+    identity_reacquire_timeout_s: float = 0.25
 
     def __post_init__(self) -> None:
         positive = (
@@ -58,6 +60,13 @@ class HadesFusionSettings:
             or self.yaw_upper_velocity_m_s <= self.yaw_lower_velocity_m_s
         ):
             raise TrackerError("Hades yaw velocity thresholds must be finite and increasing")
+        if not math.isfinite(self.identity_max_speed_px_s) or self.identity_max_speed_px_s <= 0.0:
+            raise TrackerError("identity max_speed_px_s must be positive")
+        if (
+            not math.isfinite(self.identity_reacquire_timeout_s)
+            or self.identity_reacquire_timeout_s <= 0.0
+        ):
+            raise TrackerError("identity reacquire_timeout_s must be positive")
 
     @classmethod
     def load(cls, path: str | Path) -> "HadesFusionSettings":
@@ -67,6 +76,7 @@ class HadesFusionSettings:
             camera = raw["camera"]
             imu = raw["imu"]
             yaw = raw["yaw_drift_correction"]
+            identity = raw.get("identity_tracking", {})
             return cls(
                 camera_measurement_uncertainty=float(camera["measurement_uncertainty"]),
                 camera_estimation_uncertainty=float(camera["estimation_uncertainty"]),
@@ -81,6 +91,10 @@ class HadesFusionSettings:
                 yaw_measurement_uncertainty=float(yaw["measurement_uncertainty"]),
                 yaw_estimation_uncertainty=float(yaw["estimation_uncertainty"]),
                 yaw_process_noise=float(yaw["process_noise"]),
+                identity_max_speed_px_s=float(identity.get("max_speed_px_s", 6000.0)),
+                identity_reacquire_timeout_s=float(
+                    identity.get("reacquire_timeout_s", 0.25)
+                ),
             )
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise TrackerError(f"Cannot load Hades fusion settings {path}: {exc}") from exc

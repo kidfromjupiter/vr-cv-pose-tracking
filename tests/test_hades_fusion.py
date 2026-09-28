@@ -135,6 +135,47 @@ def test_settings_load_and_validation(tmp_path):
     settings = HadesFusionSettings.load(path)
     assert settings.camera_measurement_uncertainty == 3.0
     assert settings.velocity_damping == 0.8
+    assert settings.identity_max_speed_px_s == 6000.0
+    assert settings.identity_reacquire_timeout_s == 0.25
 
     with pytest.raises(TrackerError):
         HadesFusionSettings(velocity_damping=1.1)
+    with pytest.raises(TrackerError):
+        HadesFusionSettings(identity_max_speed_px_s=0.0)
+    with pytest.raises(TrackerError):
+        HadesFusionSettings(identity_reacquire_timeout_s=0.0)
+
+
+def test_settings_load_custom_identity_tracking(tmp_path):
+    source = {
+        "camera": {
+            "measurement_uncertainty": 2,
+            "estimation_uncertainty": 1,
+            "process_noise": 7.5,
+        },
+        "imu": {
+            "measurement_uncertainty": 2,
+            "estimation_uncertainty": 5,
+            "process_noise": 22.55,
+        },
+        "velocity_damping": 0.9,
+        "yaw_drift_correction": {
+            "enabled": False,
+            "lower_velocity_m_s": 2,
+            "upper_velocity_m_s": 5,
+            "measurement_uncertainty": 5,
+            "estimation_uncertainty": 1.25,
+            "process_noise": 2,
+        },
+        "identity_tracking": {
+            "max_speed_px_s": 8000,
+            "reacquire_timeout_s": 0.4,
+        },
+    }
+    path = tmp_path / "fusion.json"
+    path.write_text(json.dumps(source), encoding="utf-8")
+
+    settings = HadesFusionSettings.load(path)
+
+    assert settings.identity_max_speed_px_s == 8000.0
+    assert settings.identity_reacquire_timeout_s == 0.4

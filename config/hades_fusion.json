@@ -17,5 +17,9 @@
     "measurement_uncertainty": 5.0,
     "estimation_uncertainty": 1.25,
     "process_noise": 2.0
+  },
+  "identity_tracking": {
+    "max_speed_px_s": 6000.0,
+    "reacquire_timeout_s": 0.25
   }
 }

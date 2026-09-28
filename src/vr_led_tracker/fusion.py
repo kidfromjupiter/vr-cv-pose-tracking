@@ -36,7 +36,12 @@ class FusionTracker:
         self.model = model
         self.slot = slot
         self.settings = settings or HadesFusionSettings()
-        self.pose_estimator = PoseEstimator(model, calibration)
+        self.pose_estimator = PoseEstimator(
+            model,
+            calibration,
+            identity_max_speed_px_s=self.settings.identity_max_speed_px_s,
+            identity_reacquire_timeout_s=self.settings.identity_reacquire_timeout_s,
+        )
         self.filter = HadesMotionFilter(self.settings)
         self.timestamp_mapper = TimestampMapper()
         self.state = "CALIBRATING_STILL"
@@ -107,6 +112,7 @@ class FusionTracker:
             detections,
             self.filter.rotation if prediction_fresh else None,
             self.filter.position_filter.current_estimate * 1000.0 if prediction_fresh else None,
+            frame_time=read_time,
         )
         if not self.filter.initialized:
             return self._calibrate_still(estimate, visible, read_time)

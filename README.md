@@ -106,6 +106,12 @@ camera-velocity yaw correction is also available under
 rotation is used only for startup alignment and subsequent orientation comes
 entirely from the receiver quaternion.
 
+The same file's `identity_tracking` section controls temporal sphere identity.
+Each sphere is predicted from its last two accepted image positions. An
+assignment implying more than `max_speed_px_s` for any sphere is rejected; if
+no assignment remains, IMU-only tracking is used until the tracks can be
+continued or `reacquire_timeout_s` expires.
+
 White spheres are segmented automatically from low-saturation pixels using an
 adaptive per-frame brightness threshold. The asymmetric model and predicted
 pose assign the unordered white blobs to `sphere_0`, `sphere_1`, and
@@ -144,7 +150,8 @@ vr-led-tracker inertial-preview --device /dev/ttyACM0 --baud 230400
 - **Wrong depth:** verify camera calibration, physical sphere diameters, and
   sphere-center coordinates.
 - **Pose jumps:** confirm model axes match the firmware IMU body axes and the
-  correct `--imu-slot` is selected.
+  correct `--imu-slot` is selected. If real high-speed movement is rejected by
+  the identity gate, raise `identity_tracking.max_speed_px_s` gradually.
 
 ## Tests
 

@@ -143,3 +143,46 @@ def test_stale_imu_with_camera_is_camera_only(model, calibration):
     )
     result = tracker.process_camera(detections, 2.0)
     assert result.state == "CAMERA_ONLY"
+
+
+def test_camera_frame_time_is_forwarded_to_identity_tracker(model, calibration):
+    tracker = FusionTracker(model, calibration, "right")
+    received = []
+
+    def capture_time(_detections, _rotation, _translation, *, frame_time):
+        received.append(frame_time)
+        return None
+
+    tracker.pose_estimator.estimate_camera_pose = capture_time
+    tracker.process_camera([], 12.5)
+    assert received == [12.5]
+
+
+def test_implausible_identity_jump_uses_imu_only(model, calibration):
+    tracker = FusionTracker(model, calibration, "right")
+    tracker.filter.initialize(
+        np.array([0.0, 0.0, 0.74]),
+        np.eye(3),
+        np.eye(3),
+        np.zeros(3),
+    )
+    tracker.latest_arrival_time = 1.01
+    first = make_detections(
+        model,
+        calibration,
+        np.zeros((3, 1)),
+        np.array([[0.0], [0.0], [740.0]]),
+    )
+    jumped = make_detections(
+        model,
+        calibration,
+        np.zeros((3, 1)),
+        np.array([[100.0], [0.0], [740.0]]),
+    )
+
+    assert tracker.process_camera(list(first.values()), 1.0).state == "FULL"
+    result = tracker.process_camera(list(jumped.values()), 1.01)
+
+    assert result.state == "IMU_ONLY"
+    assert tracker.pose_estimator.identity_gate_rejected
+    assert tracker.pose_estimator.last_assignment == {}

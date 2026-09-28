@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from itertools import combinations, permutations
 
@@ -84,17 +85,103 @@ class PoseEstimator:
         calibration: CameraCalibration,
         center_error_limit_px: float = 5.0,
         radius_error_limit: float = 0.35,
+        identity_max_speed_px_s: float = 6000.0,
+        identity_reacquire_timeout_s: float = 0.25,
     ) -> None:
         self.model = model
         self.calibration = calibration
         self.center_error_limit_px = center_error_limit_px
         self.radius_error_limit = radius_error_limit
+        self.identity_max_speed_px_s = float(identity_max_speed_px_s)
+        self.identity_reacquire_timeout_s = float(identity_reacquire_timeout_s)
         self.last_pose: PoseEstimate | None = None
         self.last_assignment: dict[str, SphereDetection] = {}
+        self.assignment_history: deque[tuple[float, dict[str, np.ndarray]]] = deque(maxlen=2)
+        self.identity_gate_rejected = False
+        self.identity_gate_detail = ""
+        self.identity_gate_speed_px_s = 0.0
 
     def reset(self) -> None:
         self.last_pose = None
         self.last_assignment.clear()
+        self.assignment_history.clear()
+        self.identity_gate_rejected = False
+        self.identity_gate_detail = ""
+        self.identity_gate_speed_px_s = 0.0
+
+    def _temporal_assignment_scores(
+        self,
+        assignments: list[dict[str, SphereDetection]],
+        frame_time: float | None,
+    ) -> tuple[list[dict[str, SphereDetection]], dict[tuple[int, ...], float]]:
+        if (
+            frame_time is None
+            or not math.isfinite(frame_time)
+            or not self.assignment_history
+        ):
+            return assignments, {}
+        last_time, last_centers = self.assignment_history[-1]
+        dt = frame_time - last_time
+        if dt <= 1e-6:
+            return assignments, {}
+        if dt >= self.identity_reacquire_timeout_s:
+            self.assignment_history.clear()
+            self.last_pose = None
+            self.identity_gate_detail = "identity history expired; using geometric reacquisition"
+            return assignments, {}
+
+        predicted = {label: center.copy() for label, center in last_centers.items()}
+        if len(self.assignment_history) == 2:
+            previous_time, previous_centers = self.assignment_history[0]
+            history_dt = last_time - previous_time
+            if history_dt > 1e-6:
+                for label in self.model.labels:
+                    velocity = (last_centers[label] - previous_centers[label]) / history_dt
+                    predicted[label] = last_centers[label] + velocity * dt
+
+        plausible: list[dict[str, SphereDetection]] = []
+        prediction_scores: dict[tuple[int, ...], float] = {}
+        minimum_max_speed = float("inf")
+        for assignment in assignments:
+            speeds = [
+                float(np.linalg.norm(assignment[label].center - last_centers[label])) / dt
+                for label in self.model.labels
+            ]
+            max_speed = max(speeds)
+            minimum_max_speed = min(minimum_max_speed, max_speed)
+            if max_speed > self.identity_max_speed_px_s:
+                continue
+            key = tuple(id(assignment[label]) for label in self.model.labels)
+            prediction_scores[key] = sum(
+                float(np.linalg.norm(assignment[label].center - predicted[label]))
+                for label in self.model.labels
+            )
+            plausible.append(assignment)
+
+        if not plausible:
+            self.identity_gate_rejected = True
+            self.identity_gate_speed_px_s = minimum_max_speed
+            remaining_ms = max(0.0, self.identity_reacquire_timeout_s - dt) * 1000.0
+            self.identity_gate_detail = (
+                f"identity motion rejected: {minimum_max_speed:.0f} px/s; "
+                f"reacquire in {remaining_ms:.0f} ms"
+            )
+        return plausible, prediction_scores
+
+    def _record_assignment(
+        self,
+        frame_time: float | None,
+        assignment: dict[str, SphereDetection],
+    ) -> None:
+        if frame_time is None or not math.isfinite(frame_time):
+            return
+        if self.assignment_history and frame_time <= self.assignment_history[-1][0]:
+            return
+        centers = {
+            label: np.asarray(assignment[label].center, dtype=np.float64).copy()
+            for label in self.model.labels
+        }
+        self.assignment_history.append((frame_time, centers))
 
     def _metrics(
         self,
@@ -135,10 +222,15 @@ class PoseEstimator:
         detections: dict[str, SphereDetection] | list[SphereDetection],
         predicted_rotation: np.ndarray | None = None,
         predicted_translation: np.ndarray | None = None,
+        frame_time: float | None = None,
     ) -> PoseEstimate | None:
         previous_assignment = dict(self.last_assignment)
         self.last_assignment = {}
+        self.identity_gate_rejected = False
+        self.identity_gate_detail = ""
+        self.identity_gate_speed_px_s = 0.0
         projected_prediction: np.ndarray | None = None
+        prediction_scores: dict[tuple[int, ...], float] = {}
         if isinstance(detections, dict):
             assignments = [detections]
         else:
@@ -149,6 +241,13 @@ class PoseEstimator:
                 for group in combinations(detections[:8], 3)
                 for ordered in permutations(group)
             ]
+            assignments, prediction_scores = self._temporal_assignment_scores(
+                assignments, frame_time
+            )
+            if not assignments:
+                return None
+            if self.identity_gate_detail:
+                previous_assignment = {}
             if predicted_rotation is not None and predicted_translation is not None:
                 try:
                     predicted_rvec, _ = cv2.Rodrigues(
@@ -199,7 +298,10 @@ class PoseEstimator:
                         float(np.linalg.norm(assignment[label].center - point))
                         for label, point in zip(self.model.labels, projected_prediction)
                     )
-                if all(label in previous_assignment for label in self.model.labels):
+                temporal_key = tuple(id(assignment[label]) for label in self.model.labels)
+                if temporal_key in prediction_scores:
+                    total += 0.25 * prediction_scores[temporal_key]
+                elif all(label in previous_assignment for label in self.model.labels):
                     total += 0.08 * sum(
                         float(
                             np.linalg.norm(
@@ -218,6 +320,7 @@ class PoseEstimator:
             return None
         self.last_pose = estimate
         self.last_assignment = dict(best[2])
+        self._record_assignment(frame_time, best[2])
         return estimate
 
     def _labeled_pose_candidates(

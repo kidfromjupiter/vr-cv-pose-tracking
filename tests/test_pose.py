@@ -124,6 +124,106 @@ def test_identity_assignment_stays_stable_between_frames(model, calibration):
         )
 
 
+def test_identity_gate_rejects_implausible_motion_then_reacquires(model, calibration):
+    estimator = PoseEstimator(
+        model,
+        calibration,
+        identity_max_speed_px_s=6000.0,
+        identity_reacquire_timeout_s=0.25,
+    )
+    first = make_detections(
+        model,
+        calibration,
+        np.zeros((3, 1)),
+        np.array([[0.0], [0.0], [740.0]]),
+    )
+    jumped = make_detections(
+        model,
+        calibration,
+        np.zeros((3, 1)),
+        np.array([[100.0], [0.0], [740.0]]),
+    )
+
+    assert estimator.estimate_camera_pose(list(first.values()), frame_time=1.0) is not None
+    assert estimator.estimate_camera_pose(list(jumped.values()), frame_time=1.01) is None
+    assert estimator.identity_gate_rejected
+    assert estimator.identity_gate_speed_px_s > 10_000.0
+    assert "reacquire in" in estimator.identity_gate_detail
+    assert len(estimator.assignment_history) == 1
+
+    estimate = estimator.estimate_camera_pose(list(jumped.values()), frame_time=1.26)
+    assert estimate is not None
+    assert not estimator.identity_gate_rejected
+    assert "geometric reacquisition" in estimator.identity_gate_detail
+    assert len(estimator.assignment_history) == 1
+
+
+def test_constant_velocity_prediction_preserves_identity_at_crossing(model, calibration):
+    estimator = PoseEstimator(model, calibration)
+    base = make_detections(
+        model,
+        calibration,
+        np.zeros((3, 1)),
+        np.array([[0.0], [0.0], [740.0]]),
+    )
+
+    def assignment(x0, x1, x2):
+        return {
+            model.labels[0]: replace(base[model.labels[0]], center=np.array([x0, 50.0])),
+            model.labels[1]: replace(base[model.labels[1]], center=np.array([x1, 50.0])),
+            model.labels[2]: replace(base[model.labels[2]], center=np.array([x2, 90.0])),
+        }
+
+    estimator._record_assignment(1.00, assignment(0.0, 30.0, 60.0))
+    estimator._record_assignment(1.01, assignment(10.0, 20.0, 60.0))
+    continuous = assignment(20.0, 10.0, 60.0)
+    swapped = {
+        model.labels[0]: continuous[model.labels[1]],
+        model.labels[1]: continuous[model.labels[0]],
+        model.labels[2]: continuous[model.labels[2]],
+    }
+
+    plausible, scores = estimator._temporal_assignment_scores(
+        [swapped, continuous], 1.02
+    )
+
+    assert len(plausible) == 2
+    continuous_key = tuple(id(continuous[label]) for label in model.labels)
+    swapped_key = tuple(id(swapped[label]) for label in model.labels)
+    assert scores[continuous_key] == pytest.approx(0.0)
+    assert scores[continuous_key] < scores[swapped_key]
+
+
+@pytest.mark.parametrize("frame_time", [None, float("nan"), 1.0])
+def test_invalid_or_nonmonotonic_time_bypasses_identity_gate(model, calibration, frame_time):
+    estimator = PoseEstimator(model, calibration)
+    base = make_detections(
+        model,
+        calibration,
+        np.zeros((3, 1)),
+        np.array([[0.0], [0.0], [740.0]]),
+    )
+    estimator._record_assignment(1.0, base)
+    assignments, scores = estimator._temporal_assignment_scores([base], frame_time)
+    assert assignments == [base]
+    assert scores == {}
+
+
+def test_reset_clears_identity_motion_history(model, calibration):
+    estimator = PoseEstimator(model, calibration)
+    detections = make_detections(
+        model,
+        calibration,
+        np.zeros((3, 1)),
+        np.array([[0.0], [0.0], [740.0]]),
+    )
+    assert estimator.estimate_camera_pose(list(detections.values()), frame_time=1.0) is not None
+    assert estimator.assignment_history
+    estimator.reset()
+    assert not estimator.assignment_history
+    assert not estimator.identity_gate_rejected
+
+
 def test_projected_sphere_radius_tracks_depth(calibration):
     near = projected_sphere_radius_px(np.array([0.0, 0.0, 500.0]), 20.0, calibration)
     far = projected_sphere_radius_px(np.array([0.0, 0.0, 1000.0]), 20.0, calibration)
