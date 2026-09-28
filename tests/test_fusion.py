@@ -40,7 +40,7 @@ def test_guided_stillness_initializes_fusion(model, calibration):
     tracker = FusionTracker(model, calibration, "right")
     rvec = np.array([[0.0], [0.0], [0.0]])
     tvec = np.array([[20.0], [-10.0], [750.0]])
-    detections = make_detections(model, calibration, rvec, tvec)
+    detections = list(reversed(list(make_detections(model, calibration, rvec, tvec).values())))
     result = None
     for index in range(70):
         now = index * 0.02
@@ -51,6 +51,26 @@ def test_guided_stillness_initializes_fusion(model, calibration):
     assert result.pose is not None
     assert result.camera_latency_s == 0.0
     np.testing.assert_allclose(result.pose.position_m, tvec.reshape(3) / 1000.0, atol=0.01)
+
+
+def test_two_white_candidates_fall_back_to_imu_only(model, calibration):
+    tracker = FusionTracker(model, calibration, "right")
+    tracker.filter.initialize(np.zeros(3), np.eye(3), np.eye(3), np.zeros(3))
+    tracker.latest_arrival_time = 2.0
+    tracker.last_camera_update = 1.9
+    detections = list(
+        make_detections(
+            model,
+            calibration,
+            np.zeros((3, 1)),
+            np.array([[0.0], [0.0], [750.0]]),
+        ).values()
+    )[:2]
+
+    result = tracker.process_camera(detections, 2.0)
+
+    assert result.state == "IMU_ONLY"
+    assert tracker.pose_estimator.last_assignment == {}
 
 
 def test_guided_stillness_tolerates_imu_yaw_drift(model, calibration):

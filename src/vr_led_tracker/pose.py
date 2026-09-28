@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from itertools import combinations, permutations
 
 import cv2
 import numpy as np
@@ -89,9 +90,11 @@ class PoseEstimator:
         self.center_error_limit_px = center_error_limit_px
         self.radius_error_limit = radius_error_limit
         self.last_pose: PoseEstimate | None = None
+        self.last_assignment: dict[str, SphereDetection] = {}
 
     def reset(self) -> None:
         self.last_pose = None
+        self.last_assignment.clear()
 
     def _metrics(
         self,
@@ -129,15 +132,87 @@ class PoseEstimator:
 
     def estimate_camera_pose(
         self,
-        detections: dict[str, SphereDetection],
+        detections: dict[str, SphereDetection] | list[SphereDetection],
         predicted_rotation: np.ndarray | None = None,
         predicted_translation: np.ndarray | None = None,
     ) -> PoseEstimate | None:
-        if not all(label in detections for label in self.model.labels):
+        self.last_assignment = {}
+        if isinstance(detections, dict):
+            assignments = [detections]
+        else:
+            if len(detections) < 3:
+                return None
+            assignments = [
+                dict(zip(self.model.labels, ordered))
+                for group in combinations(detections[:8], 3)
+                for ordered in permutations(group)
+            ]
+            if predicted_rotation is not None and predicted_translation is not None:
+                try:
+                    predicted_rvec, _ = cv2.Rodrigues(
+                        np.asarray(predicted_rotation, dtype=np.float64)
+                    )
+                    projected, _ = cv2.projectPoints(
+                        self.model.object_points,
+                        predicted_rvec,
+                        np.asarray(predicted_translation, dtype=np.float64).reshape(3, 1),
+                        self.calibration.camera_matrix,
+                        self.calibration.distortion,
+                    )
+                    projected = projected.reshape(-1, 2)
+                except (ValueError, cv2.error):
+                    projected = np.empty((0, 2))
+                if projected.shape == (3, 2) and np.isfinite(projected).all():
+                    ranked = sorted(
+                        assignments,
+                        key=lambda assignment: sum(
+                            float(np.linalg.norm(assignment[label].center - point))
+                            for label, point in zip(self.model.labels, projected)
+                        ),
+                    )
+                    gated = [
+                        assignment
+                        for assignment in ranked
+                        if max(
+                            float(np.linalg.norm(assignment[label].center - point))
+                            for label, point in zip(self.model.labels, projected)
+                        ) <= 200.0
+                    ]
+                    assignments = (gated or ranked)[:12]
+
+        best: tuple[float, PoseEstimate, dict[str, SphereDetection]] | None = None
+        for assignment in assignments:
+            if not all(label in assignment for label in self.model.labels):
+                continue
+            for score, estimate in self._labeled_pose_candidates(
+                assignment,
+                predicted_rotation,
+                predicted_translation,
+            ):
+                detection_quality = sum(item.score for item in assignment.values())
+                total = score - 2.0 * detection_quality
+                if best is None or total < best[0]:
+                    best = (total, estimate, assignment)
+        if best is None:
             return None
+        estimate = best[1]
+        if estimate.reprojection_error_px > self.center_error_limit_px:
+            return None
+        self.last_pose = estimate
+        self.last_assignment = dict(best[2])
+        return estimate
+
+    def _labeled_pose_candidates(
+        self,
+        detections: dict[str, SphereDetection],
+        predicted_rotation: np.ndarray | None,
+        predicted_translation: np.ndarray | None,
+    ) -> list[tuple[float, PoseEstimate]]:
         image_points = np.asarray(
             [detections[label].center for label in self.model.labels], dtype=np.float64
         )
+        if not np.isfinite(image_points).all():
+            return []
         try:
             count, rvecs, tvecs = cv2.solveP3P(
                 np.ascontiguousarray(self.model.object_points, dtype=np.float64),
@@ -147,13 +222,18 @@ class PoseEstimator:
                 flags=cv2.SOLVEPNP_P3P,
             )
         except cv2.error:
-            return None
+            return []
         candidates: list[tuple[float, PoseEstimate]] = []
         for rvec, tvec in zip(rvecs[:count], tvecs[:count]):
             rotation, _ = cv2.Rodrigues(rvec)
             translation = np.asarray(tvec, dtype=np.float64).reshape(3)
             camera_points = (rotation @ self.model.object_points.T).T + translation
-            if np.any(camera_points[:, 2] <= 1.0):
+            if (
+                not np.isfinite(rotation).all()
+                or not np.isfinite(translation).all()
+                or np.any(camera_points[:, 2] <= 100.0)
+                or np.any(camera_points[:, 2] >= 5000.0)
+            ):
                 continue
             center_error, radius_error = self._metrics(
                 [0, 1, 2], detections, rotation, translation
@@ -183,157 +263,4 @@ class PoseEstimator:
                     ),
                 )
             )
-        if not candidates:
-            return None
-        estimate = min(candidates, key=lambda item: item[0])[1]
-        # Mask area varies substantially with exposure and motion blur. Sphere
-        # radius remains useful for ranking P3P candidates, but must not reject
-        # an otherwise consistent labeled-center solution.
-        if estimate.reprojection_error_px > self.center_error_limit_px:
-            return None
-        self.last_pose = estimate
-        return estimate
-
-    def estimate_translation(
-        self,
-        detections: dict[str, SphereDetection],
-        rotation: np.ndarray,
-        initial_translation: np.ndarray | None = None,
-    ) -> PoseEstimate | None:
-        indices = [index for index, label in enumerate(self.model.labels) if label in detections]
-        if len(indices) < 2:
-            return None
-        rotation = np.asarray(rotation, dtype=np.float64)
-        image_points = np.asarray(
-            [detections[self.model.labels[i]].center for i in indices], dtype=np.float64
-        )
-        if rotation.shape != (3, 3) or not np.isfinite(rotation).all() or not np.isfinite(image_points).all():
-            return None
-        if any(
-            not math.isfinite(detections[self.model.labels[i]].radius)
-            or detections[self.model.labels[i]].radius <= 0.0
-            for i in indices
-        ):
-            return None
-        try:
-            normalized = cv2.undistortPoints(
-                image_points.reshape(-1, 1, 2),
-                self.calibration.camera_matrix,
-                self.calibration.distortion,
-            ).reshape(-1, 2)
-        except cv2.error:
-            return None
-        if not np.isfinite(normalized).all():
-            return None
-        bearings = np.column_stack([normalized, np.ones(len(indices))])
-        bearing_norms = np.linalg.norm(bearings, axis=1, keepdims=True)
-        if not np.isfinite(bearing_norms).all() or np.any(bearing_norms <= 1e-12):
-            return None
-        bearings /= bearing_norms
-        blocks = []
-        targets = []
-        for index, bearing in zip(indices, bearings):
-            projection = np.eye(3) - np.outer(bearing, bearing)
-            blocks.append(projection)
-            targets.append(-projection @ (rotation @ self.model.object_points[index]))
-        design = np.vstack(blocks)
-        target = np.concatenate(targets)
-        translation = self._damped_solve(design, target, 1e-9)
-        if translation is None:
-            return None
-        if initial_translation is not None:
-            initial = np.asarray(initial_translation, dtype=np.float64).reshape(3)
-            if not np.isfinite(initial).all():
-                return None
-            translation = 0.75 * translation + 0.25 * initial
-
-        for _ in range(8):
-            residual = self._translation_residual(indices, detections, rotation, translation)
-            if not np.isfinite(residual).all():
-                return None
-            jacobian = np.empty((len(residual), 3), dtype=np.float64)
-            for axis in range(3):
-                shifted = translation.copy()
-                shifted[axis] += 0.1
-                shifted_residual = self._translation_residual(
-                    indices, detections, rotation, shifted
-                )
-                if not np.isfinite(shifted_residual).all():
-                    return None
-                jacobian[:, axis] = (shifted_residual - residual) / 0.1
-            step = self._damped_solve(jacobian, -residual, 1e-3)
-            if step is None:
-                return None
-            translation += np.clip(step, -50.0, 50.0)
-            if not np.isfinite(translation).all():
-                return None
-            if np.linalg.norm(step) < 1e-3:
-                break
-        camera_points = (rotation @ self.model.object_points[indices].T).T + translation
-        if np.any(camera_points[:, 2] <= 1.0):
-            return None
-        center_error, radius_error = self._metrics(indices, detections, rotation, translation)
-        limit = self.center_error_limit_px if len(indices) == 3 else 3.5
-        # With a known IMU orientation, labeled center bearings constrain
-        # translation. A partially segmented sphere changes its measured area
-        # but should not invalidate that position measurement.
-        if center_error > limit:
-            return None
-        rvec, _ = cv2.Rodrigues(rotation)
-        estimate = PoseEstimate(
-            rvec.reshape(3, 1),
-            translation.reshape(3, 1),
-            center_error,
-            radius_error,
-            "FULL" if len(indices) == 3 else "DEGRADED_2",
-            len(indices),
-        )
-        self.last_pose = estimate
-        return estimate
-
-    @staticmethod
-    def _damped_solve(
-        matrix: np.ndarray,
-        target: np.ndarray,
-        damping: float,
-    ) -> np.ndarray | None:
-        matrix = np.asarray(matrix, dtype=np.float64)
-        target = np.asarray(target, dtype=np.float64)
-        if (
-            matrix.ndim != 2
-            or target.shape != (matrix.shape[0],)
-            or matrix.shape[1] != 3
-            or not np.isfinite(matrix).all()
-            or not np.isfinite(target).all()
-        ):
-            return None
-        normal = matrix.T @ matrix + np.eye(3) * damping
-        right_hand_side = matrix.T @ target
-        if not np.isfinite(normal).all() or not np.isfinite(right_hand_side).all():
-            return None
-        try:
-            solution = np.linalg.solve(normal, right_hand_side)
-        except np.linalg.LinAlgError:
-            return None
-        return solution if np.isfinite(solution).all() else None
-
-    def _translation_residual(
-        self,
-        indices: list[int],
-        detections: dict[str, SphereDetection],
-        rotation: np.ndarray,
-        translation: np.ndarray,
-    ) -> np.ndarray:
-        rvec, _ = cv2.Rodrigues(rotation)
-        projected, _ = cv2.projectPoints(
-            self.model.object_points[indices],
-            rvec,
-            translation.reshape(3, 1),
-            self.calibration.camera_matrix,
-            self.calibration.distortion,
-        )
-        observed = np.asarray([detections[self.model.labels[i]].center for i in indices])
-        return np.asarray(
-            (projected.reshape(-1, 2) - observed).reshape(-1),
-            dtype=np.float64,
-        )
+        return candidates

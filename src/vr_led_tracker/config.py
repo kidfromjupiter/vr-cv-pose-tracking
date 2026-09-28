@@ -59,9 +59,7 @@ class ControllerModel:
     def load(cls, path: str | Path) -> "ControllerModel":
         raw = _read_json(path)
         if "leds" in raw:
-            raise TrackerError(
-                "Legacy four-LED models are unsupported; define red, blue, and white spheres"
-            )
+            raise TrackerError("Legacy LED models are unsupported; define three white spheres")
         raw_spheres = raw.get("spheres")
         if not isinstance(raw_spheres, list) or len(raw_spheres) != 3:
             raise TrackerError("Controller model must define exactly three spheres")
@@ -87,10 +85,11 @@ class ControllerModel:
             spheres.append(SphereDefinition(label.strip().lower(), point, diameter))
 
         labels = [sphere.label for sphere in spheres]
-        if set(labels) != {"red", "blue", "white"} or len(set(labels)) != 3:
-            raise TrackerError("Sphere labels must be exactly red, blue, and white")
+        required_labels = {"sphere_0", "sphere_1", "sphere_2"}
+        if set(labels) != required_labels or len(set(labels)) != 3:
+            raise TrackerError("Sphere labels must be exactly sphere_0, sphere_1, and sphere_2")
         by_label = {sphere.label: sphere for sphere in spheres}
-        spheres = [by_label[label] for label in ("red", "blue", "white")]
+        spheres = [by_label[label] for label in ("sphere_0", "sphere_1", "sphere_2")]
         points = np.asarray([sphere.center_mm for sphere in spheres])
         distances = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
         if np.any((distances + np.eye(3)) < 1e-6):
@@ -99,6 +98,12 @@ class ControllerModel:
         area2 = float(np.linalg.norm(np.cross(points[1] - points[0], points[2] - points[0])))
         if extent <= 0 or area2 / (extent**2) < 0.01:
             raise TrackerError("Sphere centers are collinear or nearly collinear")
+        pair_distances = np.sort(distances[np.triu_indices(3, 1)])
+        relative_separation = np.diff(pair_distances) / pair_distances[-1]
+        if np.min(relative_separation) < 0.05:
+            raise TrackerError(
+                "White-sphere geometry is too symmetric; pair distances must differ by at least 5%"
+            )
         return cls(tuple(spheres))
 
 
@@ -156,78 +161,3 @@ class CameraCalibration:
         matrix[1, :] *= sy
         matrix[2, 2] = 1.0
         return CameraCalibration(size, matrix, self.distortion.copy(), self.rms_error, self.board)
-
-
-@dataclass(frozen=True)
-class ColorProfile:
-    label: str
-    hsv_ranges: tuple[tuple[np.ndarray, np.ndarray], ...]
-    min_area_px: float = 6.0
-    max_area_px: float = 20000.0
-    min_circularity: float = 0.25
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "label": self.label,
-            "hsv_ranges": [
-                {"lower": lower.tolist(), "upper": upper.tolist()}
-                for lower, upper in self.hsv_ranges
-            ],
-            "min_area_px": self.min_area_px,
-            "max_area_px": self.max_area_px,
-            "min_circularity": self.min_circularity,
-        }
-
-
-def save_color_profiles(path: str | Path, profiles: list[ColorProfile]) -> None:
-    _write_json(path, {"profiles": [profile.to_json() for profile in profiles]})
-
-
-def load_color_profiles(path: str | Path, expected_labels: tuple[str, ...]) -> tuple[ColorProfile, ...]:
-    raw = _read_json(path)
-    items = raw.get("profiles")
-    if not isinstance(items, list):
-        raise TrackerError("Color calibration must contain a profiles list")
-    profiles: list[ColorProfile] = []
-    for item in items:
-        try:
-            label = str(item["label"])
-            ranges = []
-            for hsv_range in item["hsv_ranges"]:
-                lower_values = np.asarray(hsv_range["lower"], dtype=np.float64)
-                upper_values = np.asarray(hsv_range["upper"], dtype=np.float64)
-                if (
-                    lower_values.shape != (3,)
-                    or upper_values.shape != (3,)
-                    or not np.isfinite(lower_values).all()
-                    or not np.isfinite(upper_values).all()
-                    or np.any(lower_values < 0)
-                    or np.any(upper_values > [179, 255, 255])
-                    or np.any(lower_values > upper_values)
-                ):
-                    raise ValueError
-                lower = lower_values.astype(np.uint8)
-                upper = upper_values.astype(np.uint8)
-                ranges.append((lower, upper))
-            min_area = float(item.get("min_area_px", 6.0))
-            max_area = float(item.get("max_area_px", 20000.0))
-            min_circularity = float(item.get("min_circularity", 0.25))
-            if min_area <= 0 or max_area <= min_area or not 0 <= min_circularity <= 1:
-                raise ValueError
-            profile = ColorProfile(
-                label,
-                tuple(ranges),
-                min_area,
-                max_area,
-                min_circularity,
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise TrackerError("Invalid color profile") from exc
-        if not profile.hsv_ranges:
-            raise TrackerError(f"Color profile {label} has no HSV ranges")
-        profiles.append(profile)
-    labels = tuple(profile.label for profile in profiles)
-    if len(set(labels)) != len(labels) or set(labels) != set(expected_labels):
-        raise TrackerError("Color profile labels must exactly match the controller model")
-    by_label = {profile.label: profile for profile in profiles}
-    return tuple(by_label[label] for label in expected_labels)

@@ -14,9 +14,9 @@ def model_file(tmp_path):
         """
         {
           "spheres": [
-            {"label": "red", "center_mm": [-70, 0, 0], "diameter_mm": 24},
-            {"label": "blue", "center_mm": [70, 0, 0], "diameter_mm": 30},
-            {"label": "white", "center_mm": [0, 45, 30], "diameter_mm": 20}
+            {"label": "sphere_0", "center_mm": [-70, 0, 0], "diameter_mm": 20},
+            {"label": "sphere_1", "center_mm": [70, 0, 0], "diameter_mm": 20},
+            {"label": "sphere_2", "center_mm": [10, 45, 30], "diameter_mm": 20}
           ]
         }
         """,

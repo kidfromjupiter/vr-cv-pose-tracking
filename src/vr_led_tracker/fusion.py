@@ -130,15 +130,20 @@ class FusionTracker:
 
     def process_camera(
         self,
-        detections: dict[str, SphereDetection],
+        detections: dict[str, SphereDetection] | list[SphereDetection],
         read_time: float,
     ) -> FusionResult:
         visible = len(detections)
         self.last_camera_read_time = read_time
+        prediction_fresh = (
+            self.filter.initialized
+            and self.last_camera_update is not None
+            and read_time - self.last_camera_update <= 0.25
+        )
         full = self.pose_estimator.estimate_camera_pose(
             detections,
-            self.filter.rotation if self.filter.initialized else None,
-            self.filter.position * 1000.0 if self.filter.initialized else None,
+            self.filter.rotation if prediction_fresh else None,
+            self.filter.position * 1000.0 if prediction_fresh else None,
         )
         if not self.filter.initialized:
             return self._calibrate_still(full, visible, read_time)
@@ -157,24 +162,6 @@ class FusionTracker:
             self.last_camera_update = read_time
             self.last_camera_estimate = full
             self.state = "FULL"
-        elif imu_fresh and visible >= 2:
-            past_rotation, past_translation = self._predicted_pose_at(measurement_time)
-            camera_estimate = self.pose_estimator.estimate_translation(
-                detections,
-                past_rotation,
-                past_translation * 1000.0,
-            )
-            if camera_estimate is not None:
-                orientation = full and self._rotation(full)
-                self._delayed_camera_update(
-                    measurement_time,
-                    camera_estimate.tvec.reshape(3) / 1000.0,
-                    orientation,
-                    0.01 if visible == 3 else 0.025,
-                )
-                self.last_camera_update = read_time
-                self.last_camera_estimate = camera_estimate
-                self.state = "FULL" if visible == 3 else "DEGRADED_2"
         elif full is not None:
             self.filter.update_camera(
                 full.tvec.reshape(3) / 1000.0,
@@ -197,7 +184,7 @@ class FusionTracker:
         self, full: PoseEstimate | None, visible: int, read_time: float
     ) -> FusionResult:
         if full is None:
-            self._reset_still_window("need a stable pose from all three spheres")
+            self._reset_still_window("need a stable assignment of all three white spheres")
             return self.result(visible)
         if self.latest_sample is None or self.latest_imu_rotation is None:
             self._reset_still_window(f"waiting for {self.slot} IMU packets")
@@ -260,13 +247,6 @@ class FusionTracker:
         self.bias_samples.clear()
         self.still_camera_poses.clear()
         self.calibration_detail = detail
-
-    def _predicted_pose_at(self, timestamp: float) -> tuple[np.ndarray, np.ndarray]:
-        if not self.history:
-            return self.filter.rotation.copy(), self.filter.position.copy()
-        entry = min(self.history, key=lambda item: abs(item.timestamp - timestamp))
-        state = entry.filter_state
-        return np.asarray(state["rotation"]).copy(), np.asarray(state["position"]).copy()
 
     def _delayed_camera_update(
         self,

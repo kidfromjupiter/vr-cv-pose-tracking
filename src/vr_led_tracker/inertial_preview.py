@@ -39,7 +39,6 @@ STATE_COLORS = {
     "STALE": (50, 50, 255),
     "CALIBRATING_STILL": (0, 210, 255),
     "FULL": (60, 230, 60),
-    "DEGRADED_2": (0, 200, 255),
     "IMU_ONLY": (0, 160, 255),
     "CAMERA_ONLY": (200, 160, 40),
     "LOST": (50, 50, 255),

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from vr_led_tracker.cli import build_parser, main
 
 
@@ -9,9 +11,9 @@ def test_inertial_preview_defaults():
     assert args.baud == 230400
 
 
-def test_color_calibration_collects_more_frames_by_default():
-    args = build_parser().parse_args(["calibrate-colors"])
-    assert args.samples_per_color == 10
+def test_color_calibration_command_is_removed():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["calibrate-colors"])
 
 
 def test_tracking_uses_zero_fixed_camera_latency_by_default():

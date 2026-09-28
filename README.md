@@ -1,38 +1,38 @@
-# Three-Sphere VR Tracker
+# Three White Sphere VR Tracker
 
 A calibrated OpenCV and IMU fusion tracker for one rigid controller carrying
-red, blue, and white spheres. A low-latency V4L2 stream, such as an adb/scrcpy
-camera feed, provides camera-relative position while the ESP32 controller
-provides timestamped quaternion and acceleration samples.
+three white spheres. A low-latency V4L2 stream, such as an adb/scrcpy camera
+feed, provides camera-relative position while the ESP32 controller provides
+timestamped quaternion and acceleration samples.
 An error-state Kalman filter predicts at IMU rate and corrects drift from the
 camera.
 
 ## Tracking model
 
-The controller model contains exactly three non-collinear sphere centers and
-their physical diameters. Measurements are in millimetres, with the origin at
-the IMU center and axes matching the body axes configured in the controller
-firmware:
+The controller model contains exactly three non-collinear, asymmetrically
+spaced sphere centers and their physical diameters. Measurements are in
+millimetres, with the origin at the IMU center and axes matching the body axes
+configured in the controller firmware:
 
 ```json
 {
   "spheres": [
-    {"label": "red",   "center_mm": [-70, 0, 0], "diameter_mm": 20},
-    {"label": "blue",  "center_mm": [70, 0, 0],  "diameter_mm": 20},
-    {"label": "white", "center_mm": [0, 45, 30], "diameter_mm": 20}
+    {"label": "sphere_0", "center_mm": [-70, 0, 0],  "diameter_mm": 20},
+    {"label": "sphere_1", "center_mm": [70, 0, 0],   "diameter_mm": 20},
+    {"label": "sphere_2", "center_mm": [15, 45, 30], "diameter_mm": 20}
   ]
 }
 ```
 
 The values in `config/controller.example.json` are examples only. Measure all
-three centers and diameters on the real rigid assembly. Legacy four-LED model
-files are intentionally unsupported.
+three centers and diameters on the real rigid assembly. The three pairwise
+distances must differ by at least 5%, allowing identical white markers to be
+assigned to geometry identities. Legacy LED model files are unsupported.
 
 Tracking states:
 
 - `CALIBRATING_STILL`: hold the rig still with all spheres visible.
 - `FULL`: three-sphere camera correction plus IMU prediction.
-- `DEGRADED_2`: two-sphere position correction using IMU orientation.
 - `IMU_ONLY`: camera is briefly occluded; prediction is limited to 250 ms.
 - `CAMERA_ONLY`: all spheres are visible but IMU data is stale.
 - `LOST`: neither source can provide a safe pose.
@@ -75,22 +75,7 @@ vr-led-tracker calibrate-camera \
 
 Keep the camera zoom, orientation, and aspect ratio unchanged afterward.
 
-## 3. Calibrate sphere colors
-
-```bash
-vr-led-tracker calibrate-colors \
-  --device /dev/video0 \
-  --model config/controller.json \
-  --samples-per-color 10 \
-  --output config/colors.json
-```
-
-Click inside each prompted sphere in ten different frames and vary its angle
-and position slightly so the samples include realistic lighting changes. Red uses wrapped
-hue ranges, blue uses its sampled hue, and white uses low saturation plus high
-brightness. Press `R` to redo a color or `Q` to cancel.
-
-## 4. Run fused tracking
+## 3. Run fused tracking
 
 Close SteamVR and serial monitors, then run:
 
@@ -102,8 +87,7 @@ vr-led-tracker track \
   --imu-slot right \
   --camera-latency-ms 0 \
   --model config/controller.json \
-  --camera config/camera.json \
-  --colors config/colors.json
+  --camera config/camera.json
 ```
 
 At startup, hold the controller still with all three spheres visible for about
@@ -111,10 +95,16 @@ one second. Tracking starts immediately after that calibration. Camera delay is
 a fixed value rather than an estimated value; leave `--camera-latency-ms` at
 zero for a low-latency scrcpy stream, or provide a measured value from 0 to 500.
 
-The window shows the annotated camera image and synthetic fused 3D pose side
-by side. Controls:
+White spheres are segmented automatically from low-saturation pixels using an
+adaptive per-frame brightness threshold. The asymmetric model and predicted
+pose assign the unordered white blobs to `sphere_0`, `sphere_1`, and
+`sphere_2`.
 
-- `M`: show or hide color masks.
+The window shows the annotated camera image and synthetic fused 3D pose side
+by side. Gray circles are unassigned white candidates; colored labels identify
+the three candidates accepted by the pose solver. Controls:
+
+- `M`: show or hide the adaptive white mask.
 - `R`: discard alignment and Kalman state and recalibrate.
 - `Q` or Escape: quit.
 
@@ -132,8 +122,9 @@ vr-led-tracker inertial-preview --device /dev/ttyACM0 --baud 230400
   both translation and rotation for a full second.
 - **Camera and IMU motion are offset:** set a measured fixed delay with
   `--camera-latency-ms`; scrcpy streams should normally start at zero.
-- **White false detections:** reduce reflections and recalibrate colors under
-  the intended room lighting.
+- **White false detections:** avoid bright white background objects and strong
+  reflections. The geometric assignment rejects candidates that do not match
+  the measured asymmetric rig.
 - **Wrong depth:** verify camera calibration, physical sphere diameters, and
   sphere-center coordinates.
 - **Pose jumps:** confirm model axes match the firmware IMU body axes and the
@@ -145,6 +136,7 @@ vr-led-tracker inertial-preview --device /dev/ttyACM0 --baud 230400
 pytest
 ```
 
-The suite covers synthetic sphere projection, P3P and two-sphere translation,
-CRC framing, timestamp rollover, fixed-delay replay, and Kalman behavior. Final
-validation still requires the real camera, receiver, IMU, and sphere rig.
+The suite covers adaptive white detection, unordered identity assignment,
+synthetic sphere projection, P3P, CRC framing, timestamp rollover, fixed-delay
+replay, and Kalman behavior. Final validation still requires the real camera,
+receiver, IMU, and sphere rig.

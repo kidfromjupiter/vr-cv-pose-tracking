@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 from .camera import open_camera, read_frame
-from .config import CameraCalibration, ControllerModel, load_color_profiles
+from .config import CameraCalibration, ControllerModel
 from .detection import SphereDetection, SphereDetector
 from .errors import TrackerError
 from .filtering import rotation_matrix_to_euler_zyx
@@ -19,11 +19,14 @@ from .inertial_preview import _draw_panel
 from .serial_pose import FusionFrameParser, FusionSample
 
 
-PALETTE = {"red": (20, 20, 245), "blue": (245, 100, 20), "white": (245, 245, 245)}
+PALETTE = {
+    "sphere_0": (20, 20, 245),
+    "sphere_1": (245, 100, 20),
+    "sphere_2": (20, 220, 220),
+}
 STATE_COLORS = {
     "CALIBRATING_STILL": (0, 210, 255),
     "FULL": (40, 230, 40),
-    "DEGRADED_2": (0, 200, 255),
     "IMU_ONLY": (0, 160, 255),
     "CAMERA_ONLY": (220, 170, 30),
     "LOST": (40, 40, 255),
@@ -77,20 +80,30 @@ class _SerialReader:
 
 def _draw_detections(
     frame: np.ndarray,
-    model: ControllerModel,
-    detections: dict[str, SphereDetection],
+    candidates: list[SphereDetection],
+    assignment: dict[str, SphereDetection],
 ) -> None:
-    for sphere in model.spheres:
-        detection = detections.get(sphere.label)
-        if detection is None:
+    assigned_detections = {id(detection) for detection in assignment.values()}
+    for detection in candidates:
+        if id(detection) in assigned_detections:
             continue
         center = tuple(np.rint(detection.center).astype(int))
-        color = PALETTE[sphere.label]
+        cv2.circle(
+            frame,
+            center,
+            max(3, int(round(detection.radius))),
+            (150, 150, 150),
+            1,
+            cv2.LINE_AA,
+        )
+    for label, detection in assignment.items():
+        center = tuple(np.rint(detection.center).astype(int))
+        color = PALETTE[label]
         cv2.circle(frame, center, max(3, int(round(detection.radius))), color, 2, cv2.LINE_AA)
         cv2.drawMarker(frame, center, color, cv2.MARKER_CROSS, 10, 1)
         cv2.putText(
             frame,
-            f"{sphere.label} {2 * detection.radius:.1f}px",
+            f"{label} {2 * detection.radius:.1f}px",
             (center[0] + 7, center[1] - 7),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -171,19 +184,16 @@ def run_preview(
     imu_slot: str,
     model_path: str,
     camera_path: str,
-    colors_path: str,
     full_error_limit_px: float = 5.0,
     camera_latency_ms: float = 0.0,
 ) -> None:
     model = ControllerModel.load(model_path)
     source_calibration = CameraCalibration.load(camera_path)
-    profiles = load_color_profiles(colors_path, model.labels)
     capture = open_camera(device)
     serial_reader = _SerialReader(serial_device, baud)
-    detector = SphereDetector(profiles)
+    detector = SphereDetector()
     calibration: CameraCalibration | None = None
     tracker: FusionTracker | None = None
-    previous_pixels: dict[str, np.ndarray] = {}
     trail: deque[np.ndarray] = deque(maxlen=180)
     fps = 0.0
     previous_frame_time: float | None = None
@@ -211,11 +221,11 @@ def run_preview(
             for sample in serial_reader.drain():
                 tracker.add_imu(sample, sample.arrival_time or now)
 
-            detections, masks = detector.detect(frame, previous_pixels)
-            previous_pixels.update({label: value.center for label, value in detections.items()})
-            result = tracker.process_camera(detections, now)
+            candidates, mask, white_threshold = detector.detect(frame)
+            result = tracker.process_camera(candidates, now)
+            assignment = tracker.pose_estimator.last_assignment
             display_camera = frame.copy()
-            _draw_detections(display_camera, model, detections)
+            _draw_detections(display_camera, candidates, assignment)
             _draw_pose(display_camera, result, calibration)
 
             if result.pose is not None:
@@ -248,7 +258,7 @@ def run_preview(
                 (720, 720),
                 model.object_points / 1000.0,
                 model.diameters_mm / 1000.0,
-                tuple(PALETTE[label] for label in model.labels),
+                tuple([(245, 245, 245)] * len(model.spheres)),
             )
 
             if previous_frame_time is not None:
@@ -257,7 +267,12 @@ def run_preview(
             previous_frame_time = now
             state_color = STATE_COLORS[result.state]
             lines = [
-                (f"{result.state}  spheres {len(detections)}/3  FPS {fps:.1f}", state_color),
+                (
+                    f"{result.state}  assigned {len(assignment)}/3  "
+                    f"candidates {len(candidates)}  FPS {fps:.1f}",
+                    state_color,
+                ),
+                (f"Adaptive white threshold: V >= {white_threshold}", (235, 235, 235)),
                 (f"Camera latency: {result.camera_latency_s * 1000:.0f} ms (fixed)", (235, 235, 235)),
             ]
             if result.state == "CALIBRATING_STILL":
@@ -268,17 +283,16 @@ def run_preview(
             display = np.hstack([camera_view, synthetic])
             cv2.imshow(window, display)
             if show_masks:
-                cv2.imshow("Sphere masks", np.hstack([masks[label] for label in model.labels]))
+                cv2.imshow("White sphere mask", mask)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
                 break
             if key == ord("m"):
                 show_masks = not show_masks
                 if not show_masks:
-                    cv2.destroyWindow("Sphere masks")
+                    cv2.destroyWindow("White sphere mask")
             elif key == ord("r"):
                 tracker.reset()
-                previous_pixels.clear()
                 trail.clear()
     finally:
         capture.release()
