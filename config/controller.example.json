@@ -1,19 +1,6 @@
 {
-  "spheres": [
-    {
-      "label": "sphere_0",
-      "center_mm": [-70.0, 0.0, 0.0],
-      "diameter_mm": 20.0
-    },
-    {
-      "label": "sphere_1",
-      "center_mm": [70.0, 0.0, 0.0],
-      "diameter_mm": 20.0
-    },
-    {
-      "label": "sphere_2",
-      "center_mm": [15.0, 45.0, 30.0],
-      "diameter_mm": 20.0
-    }
-  ]
+  "ball": {
+    "label": "blue",
+    "diameter_mm": 20.0
+  }
 }

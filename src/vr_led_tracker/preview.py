@@ -9,23 +9,19 @@ import cv2
 import numpy as np
 
 from .camera import open_camera, read_frame
-from .config import CameraCalibration, ControllerModel
-from .detection import SphereDetection, SphereDetector
+from .config import BallModel, CameraCalibration, load_color_profile
+from .detection import BallDetection, BallDetector
 from .errors import TrackerError
 from .filtering import rotation_matrix_to_euler_zyx
-from .fusion import FusionResult, FusionTracker
+from .fusion import BallTracker, TrackingResult
 from .inertial import InertialPose
 from .inertial_preview import _draw_panel
 from .serial_pose import FusionFrameParser, FusionSample
 
 
-PALETTE = {
-    "sphere_0": (20, 20, 245),
-    "sphere_1": (245, 100, 20),
-    "sphere_2": (20, 220, 220),
-}
+BLUE = (245, 120, 20)
 STATE_COLORS = {
-    "CALIBRATING_STILL": (0, 210, 255),
+    "CALIBRATING_IMU": (0, 210, 255),
     "FULL": (40, 230, 40),
     "IMU_ONLY": (0, 160, 255),
     "CAMERA_ONLY": (220, 170, 30),
@@ -38,7 +34,7 @@ class _SerialReader:
         try:
             import serial
         except ImportError as exc:
-            raise TrackerError("pyserial is required for fused tracking") from exc
+            raise TrackerError("pyserial is required for IMU orientation tracking") from exc
         try:
             self.port = serial.Serial(device, baudrate=baud, timeout=0.05)
         except (OSError, serial.SerialException) as exc:
@@ -80,12 +76,11 @@ class _SerialReader:
 
 def _draw_detections(
     frame: np.ndarray,
-    candidates: list[SphereDetection],
-    assignment: dict[str, SphereDetection],
+    candidates: list[BallDetection],
+    selected: BallDetection | None,
 ) -> None:
-    assigned_detections = {id(detection) for detection in assignment.values()}
     for detection in candidates:
-        if id(detection) in assigned_detections:
+        if detection is selected:
             continue
         center = tuple(np.rint(detection.center).astype(int))
         cv2.circle(
@@ -96,28 +91,27 @@ def _draw_detections(
             1,
             cv2.LINE_AA,
         )
-    for label, detection in assignment.items():
-        center = tuple(np.rint(detection.center).astype(int))
-        color = PALETTE[label]
-        cv2.circle(frame, center, max(3, int(round(detection.radius))), color, 2, cv2.LINE_AA)
-        cv2.drawMarker(frame, center, color, cv2.MARKER_CROSS, 10, 1)
+    if selected is not None:
+        center = tuple(np.rint(selected.center).astype(int))
+        cv2.circle(frame, center, max(3, int(round(selected.radius))), BLUE, 2, cv2.LINE_AA)
+        cv2.drawMarker(frame, center, BLUE, cv2.MARKER_CROSS, 10, 1)
         cv2.putText(
             frame,
-            f"{label} {2 * detection.radius:.1f}px",
+            f"blue {2 * selected.radius:.1f}px",
             (center[0] + 7, center[1] - 7),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
-            color,
+            BLUE,
             2,
             cv2.LINE_AA,
         )
 
 
-def _draw_pose(frame: np.ndarray, result: FusionResult, calibration: CameraCalibration) -> None:
-    if result.pose is None:
+def _draw_pose(frame: np.ndarray, result: TrackingResult, calibration: CameraCalibration) -> None:
+    if result.position_m is None or result.rotation_matrix is None:
         return
-    rotation = np.asarray(result.pose.rotation_matrix, dtype=np.float64)
-    translation = np.asarray(result.pose.position_m, dtype=np.float64).reshape(3) * 1000.0
+    rotation = np.asarray(result.rotation_matrix, dtype=np.float64)
+    translation = np.asarray(result.position_m, dtype=np.float64).reshape(3) * 1000.0
     if rotation.shape != (3, 3) or not np.isfinite(rotation).all() or not np.isfinite(translation).all():
         return
     axes = np.array(
@@ -184,21 +178,21 @@ def run_preview(
     imu_slot: str,
     model_path: str,
     camera_path: str,
-    full_error_limit_px: float = 5.0,
-    camera_latency_ms: float = 0.0,
+    color_path: str,
 ) -> None:
-    model = ControllerModel.load(model_path)
+    model = BallModel.load(model_path)
     source_calibration = CameraCalibration.load(camera_path)
+    color_profile = load_color_profile(color_path)
     capture = open_camera(device)
     serial_reader = _SerialReader(serial_device, baud)
-    detector = SphereDetector()
+    detector = BallDetector(color_profile)
     calibration: CameraCalibration | None = None
-    tracker: FusionTracker | None = None
+    tracker: BallTracker | None = None
     trail: deque[np.ndarray] = deque(maxlen=180)
     fps = 0.0
     previous_frame_time: float | None = None
     show_masks = False
-    window = "Three-sphere camera/IMU tracker"
+    window = "Blue-ball camera position + IMU orientation"
     try:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window, 1440, 720)
@@ -210,34 +204,29 @@ def run_preview(
             height, width = frame.shape[:2]
             if calibration is None:
                 calibration = source_calibration.for_image_size((width, height))
-                tracker = FusionTracker(
-                    model,
-                    calibration,
-                    imu_slot,
-                    camera_latency_ms / 1000.0,
-                )
-                tracker.pose_estimator.center_error_limit_px = full_error_limit_px
+                tracker = BallTracker(model, calibration, imu_slot)
             assert tracker is not None and calibration is not None
             for sample in serial_reader.drain():
                 tracker.add_imu(sample, sample.arrival_time or now)
 
-            candidates, mask, white_threshold = detector.detect(frame)
+            candidates, mask = detector.detect(frame)
             result = tracker.process_camera(candidates, now)
-            assignment = tracker.pose_estimator.last_assignment
+            selected = None if result.camera_estimate is None else result.camera_estimate.detection
             display_camera = frame.copy()
-            _draw_detections(display_camera, candidates, assignment)
+            _draw_detections(display_camera, candidates, selected)
             _draw_pose(display_camera, result, calibration)
 
-            if result.pose is not None:
-                if not trail or np.linalg.norm(trail[-1] - result.pose.position_m) > 0.002:
-                    trail.append(result.pose.position_m.copy())
+            if result.position_m is not None:
+                if not trail or np.linalg.norm(trail[-1] - result.position_m) > 0.002:
+                    trail.append(result.position_m.copy())
+                rotation = np.eye(3) if result.rotation_matrix is None else result.rotation_matrix
                 inertial_pose = InertialPose(
                     result.state,
-                    result.pose.rotation_matrix,
-                    result.pose.position_m,
-                    result.pose.velocity_m_s,
+                    rotation,
+                    result.position_m,
+                    result.velocity_m_s,
                     np.zeros(3),
-                    rotation_matrix_to_euler_zyx(result.pose.rotation_matrix),
+                    rotation_matrix_to_euler_zyx(rotation),
                     result.calibration_progress,
                 )
             else:
@@ -251,14 +240,14 @@ def run_preview(
                     result.calibration_progress,
                 )
             synthetic = _draw_panel(
-                "FUSED",
+                "TRACKER",
                 inertial_pose,
                 (80, 210, 255),
                 trail,
                 (720, 720),
-                model.object_points / 1000.0,
-                model.diameters_mm / 1000.0,
-                tuple([(245, 245, 245)] * len(model.spheres)),
+                np.zeros((1, 3)),
+                np.array([model.diameter_mm / 1000.0]),
+                (BLUE,),
             )
 
             if previous_frame_time is not None:
@@ -268,29 +257,30 @@ def run_preview(
             state_color = STATE_COLORS[result.state]
             lines = [
                 (
-                    f"{result.state}  assigned {len(assignment)}/3  "
+                    f"{result.state}  selected {int(selected is not None)}/1  "
                     f"candidates {len(candidates)}  FPS {fps:.1f}",
                     state_color,
                 ),
-                (f"Adaptive white threshold: V >= {white_threshold}", (235, 235, 235)),
-                (f"Camera latency: {result.camera_latency_s * 1000:.0f} ms (fixed)", (235, 235, 235)),
+                (f"Ball diameter: {model.diameter_mm:.2f} mm", (235, 235, 235)),
             ]
-            if result.state == "CALIBRATING_STILL":
-                lines.append((result.calibration_detail, (0, 210, 255)))
-            lines.append(("M masks | R recalibrate | Q quit", (210, 210, 210)))
+            if result.position_stale:
+                lines.append((f"Position frozen for {result.position_age_s * 1000:.0f} ms", (0, 160, 255)))
+            if result.state == "CALIBRATING_IMU":
+                lines.append(("Hold the controller still to zero IMU orientation", (0, 210, 255)))
+            lines.append(("M mask | R recenter/reset | Q quit", (210, 210, 210)))
             camera_view = _camera_panel(display_camera, (720, 720))
             _put_lines(camera_view, lines)
             display = np.hstack([camera_view, synthetic])
             cv2.imshow(window, display)
             if show_masks:
-                cv2.imshow("White sphere mask", mask)
+                cv2.imshow("Blue ball mask", mask)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
                 break
             if key == ord("m"):
                 show_masks = not show_masks
                 if not show_masks:
-                    cv2.destroyWindow("White sphere mask")
+                    cv2.destroyWindow("Blue ball mask")
             elif key == ord("r"):
                 tracker.reset()
                 trail.clear()

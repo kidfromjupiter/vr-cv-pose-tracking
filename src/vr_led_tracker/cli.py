@@ -4,7 +4,7 @@ import argparse
 import sys
 
 from .calibration import run_camera_calibration
-from .config import ControllerModel
+from .color_calibration import run_color_calibration
 from .errors import TrackerError
 from .inertial_preview import run_inertial_preview
 from .preview import run_preview
@@ -12,7 +12,7 @@ from .preview import run_preview
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Track a three-white-sphere VR controller with a camera and IMU"
+        description="Track a blue ball's XYZ with a camera and orientation with an IMU"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -24,20 +24,24 @@ def build_parser() -> argparse.ArgumentParser:
     camera.add_argument("--square-mm", type=float, required=True, help="measured checker square size")
     camera.add_argument("--frames", type=int, default=15)
 
-    track = subparsers.add_parser("track", help="Open the fused camera/IMU pose preview")
+    color = subparsers.add_parser("calibrate-color", help="Sample the blue ball color")
+    color.add_argument("--device", default="/dev/video0")
+    color.add_argument("--output", default="config/color.json")
+    color.add_argument(
+        "--samples",
+        type=int,
+        default=10,
+        help="clicks from separate frames (default: 10)",
+    )
+
+    track = subparsers.add_parser("track", help="Open the camera position and IMU orientation preview")
     track.add_argument("--device", default="/dev/video0")
     track.add_argument("--serial-device", default="/dev/ttyACM0")
     track.add_argument("--baud", type=int, default=230400)
     track.add_argument("--imu-slot", choices=("right", "left"), default="right")
     track.add_argument("--model", default="config/controller.json")
     track.add_argument("--camera", default="config/camera.json")
-    track.add_argument("--max-reprojection-px", type=float, default=5.0)
-    track.add_argument(
-        "--camera-latency-ms",
-        type=float,
-        default=0.0,
-        help="fixed camera delay in milliseconds, from 0 to 500 (default: 0)",
-    )
+    track.add_argument("--color", default="config/color.json")
 
     inertial = subparsers.add_parser(
         "inertial-preview", help="Animate controllers from the timestamped fusion stream"
@@ -55,11 +59,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.device, args.output, args.columns, args.rows, args.square_mm, args.frames
             )
             print(f"Saved {args.output}; RMS reprojection error {calibration.rms_error:.4f} px")
+        elif args.command == "calibrate-color":
+            run_color_calibration(args.device, args.output, args.samples)
+            print(f"Saved blue ball color profile to {args.output}")
         elif args.command == "track":
-            if args.max_reprojection_px <= 0 or args.baud <= 0:
-                raise TrackerError("--max-reprojection-px and --baud must be positive")
-            if not 0.0 <= args.camera_latency_ms <= 500.0:
-                raise TrackerError("--camera-latency-ms must be between 0 and 500")
+            if args.baud <= 0:
+                raise TrackerError("--baud must be positive")
             run_preview(
                 args.device,
                 args.serial_device,
@@ -67,8 +72,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.imu_slot,
                 args.model,
                 args.camera,
-                args.max_reprojection_px,
-                args.camera_latency_ms,
+                args.color,
             )
         elif args.command == "inertial-preview":
             if args.baud <= 0:

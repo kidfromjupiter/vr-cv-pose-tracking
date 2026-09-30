@@ -11,20 +11,27 @@ def test_inertial_preview_defaults():
     assert args.baud == 230400
 
 
-def test_color_calibration_command_is_removed():
+def test_color_calibration_defaults():
+    args = build_parser().parse_args(["calibrate-color"])
+    assert args.output == "config/color.json"
+    assert args.samples == 10
+
+
+def test_tracking_defaults_to_ball_model_and_color_profile():
+    args = build_parser().parse_args(["track"])
+    assert args.model == "config/controller.json"
+    assert args.color == "config/color.json"
+    assert not hasattr(args, "camera_latency_ms")
+
+
+def test_removed_plural_color_calibration_command():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["calibrate-colors"])
 
 
-def test_tracking_uses_zero_fixed_camera_latency_by_default():
-    args = build_parser().parse_args(["track"])
-    assert args.camera_latency_ms == 0.0
-
-
-def test_tracking_rejects_out_of_range_camera_latency(capsys):
-    assert main(["track", "--camera-latency-ms", "-1"]) == 2
-    assert "--camera-latency-ms must be between 0 and 500" in capsys.readouterr().err
-    assert main(["track", "--camera-latency-ms", "501"]) == 2
+def test_tracking_rejects_nonpositive_baud(capsys):
+    assert main(["track", "--baud", "0"]) == 2
+    assert "--baud must be positive" in capsys.readouterr().err
 
 
 def test_inertial_preview_rejects_nonpositive_baud(capsys):

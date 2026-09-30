@@ -33,78 +33,93 @@ def _write_json(path: str | Path, value: dict[str, Any]) -> None:
 
 
 @dataclass(frozen=True)
-class SphereDefinition:
+class BallModel:
     label: str
-    center_mm: np.ndarray
     diameter_mm: float
+
+    @classmethod
+    def load(cls, path: str | Path) -> "BallModel":
+        raw = _read_json(path)
+        if "spheres" in raw or "leds" in raw:
+            raise TrackerError("Legacy multi-marker models are unsupported; define one blue ball")
+        item = raw.get("ball")
+        if not isinstance(item, dict):
+            raise TrackerError("Tracker model must define a ball object")
+        label = item.get("label")
+        if not isinstance(label, str) or label.strip().lower() != "blue":
+            raise TrackerError("Ball label must be blue")
+        try:
+            diameter = float(item["diameter_mm"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TrackerError("Ball needs a valid diameter_mm") from exc
+        if not np.isfinite(diameter) or diameter <= 0:
+            raise TrackerError("Ball diameter_mm must be positive")
+        return cls("blue", diameter)
 
 
 @dataclass(frozen=True)
-class ControllerModel:
-    spheres: tuple[SphereDefinition, ...]
+class ColorProfile:
+    label: str
+    hsv_ranges: tuple[tuple[np.ndarray, np.ndarray], ...]
+    min_area_px: float = 8.0
+    max_area_px: float = 20000.0
+    min_circularity: float = 0.35
 
-    @property
-    def labels(self) -> tuple[str, ...]:
-        return tuple(sphere.label for sphere in self.spheres)
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "hsv_ranges": [
+                {"lower": lower.tolist(), "upper": upper.tolist()}
+                for lower, upper in self.hsv_ranges
+            ],
+            "min_area_px": self.min_area_px,
+            "max_area_px": self.max_area_px,
+            "min_circularity": self.min_circularity,
+        }
 
-    @property
-    def object_points(self) -> np.ndarray:
-        return np.asarray([sphere.center_mm for sphere in self.spheres], dtype=np.float64)
 
-    @property
-    def diameters_mm(self) -> np.ndarray:
-        return np.asarray([sphere.diameter_mm for sphere in self.spheres], dtype=np.float64)
+def save_color_profile(path: str | Path, profile: ColorProfile) -> None:
+    _write_json(path, {"profiles": [profile.to_json()]})
 
-    @classmethod
-    def load(cls, path: str | Path) -> "ControllerModel":
-        raw = _read_json(path)
-        if "leds" in raw:
-            raise TrackerError("Legacy LED models are unsupported; define three white spheres")
-        raw_spheres = raw.get("spheres")
-        if not isinstance(raw_spheres, list) or len(raw_spheres) != 3:
-            raise TrackerError("Controller model must define exactly three spheres")
-        spheres: list[SphereDefinition] = []
-        for index, item in enumerate(raw_spheres):
-            if not isinstance(item, dict):
-                raise TrackerError(f"Sphere {index} must be an object")
-            label = item.get("label")
-            center = item.get("center_mm")
-            if not isinstance(label, str) or not label.strip():
-                raise TrackerError(f"Sphere {index} needs a non-empty label")
-            try:
-                point = np.asarray(center, dtype=np.float64)
-                diameter = float(item["diameter_mm"])
-            except (TypeError, ValueError) as exc:
-                raise TrackerError(f"Sphere {label} has invalid geometry") from exc
-            except KeyError as exc:
-                raise TrackerError(f"Sphere {label} needs diameter_mm") from exc
-            if point.shape != (3,) or not np.isfinite(point).all():
-                raise TrackerError(f"Sphere {label} center_mm must contain three finite numbers")
-            if not np.isfinite(diameter) or diameter <= 0:
-                raise TrackerError(f"Sphere {label} diameter_mm must be positive")
-            spheres.append(SphereDefinition(label.strip().lower(), point, diameter))
 
-        labels = [sphere.label for sphere in spheres]
-        required_labels = {"sphere_0", "sphere_1", "sphere_2"}
-        if set(labels) != required_labels or len(set(labels)) != 3:
-            raise TrackerError("Sphere labels must be exactly sphere_0, sphere_1, and sphere_2")
-        by_label = {sphere.label: sphere for sphere in spheres}
-        spheres = [by_label[label] for label in ("sphere_0", "sphere_1", "sphere_2")]
-        points = np.asarray([sphere.center_mm for sphere in spheres])
-        distances = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
-        if np.any((distances + np.eye(3)) < 1e-6):
-            raise TrackerError("Sphere centers must be distinct")
-        extent = float(np.max(np.ptp(points, axis=0)))
-        area2 = float(np.linalg.norm(np.cross(points[1] - points[0], points[2] - points[0])))
-        if extent <= 0 or area2 / (extent**2) < 0.01:
-            raise TrackerError("Sphere centers are collinear or nearly collinear")
-        pair_distances = np.sort(distances[np.triu_indices(3, 1)])
-        relative_separation = np.diff(pair_distances) / pair_distances[-1]
-        if np.min(relative_separation) < 0.05:
-            raise TrackerError(
-                "White-sphere geometry is too symmetric; pair distances must differ by at least 5%"
-            )
-        return cls(tuple(spheres))
+def load_color_profile(path: str | Path) -> ColorProfile:
+    raw = _read_json(path)
+    items = raw.get("profiles")
+    if not isinstance(items, list) or len(items) != 1:
+        raise TrackerError("Color calibration must contain exactly one profile")
+    item = items[0]
+    try:
+        label = str(item["label"]).strip().lower()
+        ranges = []
+        for hsv_range in item["hsv_ranges"]:
+            lower_values = np.asarray(hsv_range["lower"], dtype=np.float64)
+            upper_values = np.asarray(hsv_range["upper"], dtype=np.float64)
+            if (
+                lower_values.shape != (3,)
+                or upper_values.shape != (3,)
+                or not np.isfinite(lower_values).all()
+                or not np.isfinite(upper_values).all()
+                or np.any(lower_values < 0)
+                or np.any(upper_values > [179, 255, 255])
+                or np.any(lower_values > upper_values)
+            ):
+                raise ValueError
+            ranges.append((lower_values.astype(np.uint8), upper_values.astype(np.uint8)))
+        min_area = float(item.get("min_area_px", 8.0))
+        max_area = float(item.get("max_area_px", 20000.0))
+        min_circularity = float(item.get("min_circularity", 0.35))
+        if (
+            label != "blue"
+            or not ranges
+            or not np.isfinite([min_area, max_area, min_circularity]).all()
+            or min_area <= 0
+            or max_area <= min_area
+            or not 0 <= min_circularity <= 1
+        ):
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TrackerError("Invalid blue color profile") from exc
+    return ColorProfile(label, tuple(ranges), min_area, max_area, min_circularity)
 
 
 @dataclass(frozen=True)

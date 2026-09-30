@@ -1,3 +1,3 @@
-"""Camera and IMU fusion tracking for a three-sphere controller."""
+"""Camera XYZ tracking for a blue ball with serial IMU orientation."""
 
 __version__ = "0.1.0"

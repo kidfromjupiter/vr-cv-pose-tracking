@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vr-led-tracker"
 version = "0.1.0"
-description = "Camera and IMU fusion tracking for a three-white-sphere VR controller"
+description = "Single-camera blue-ball XYZ tracking with serial IMU orientation"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

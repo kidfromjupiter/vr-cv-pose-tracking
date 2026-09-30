@@ -38,6 +38,7 @@ STATE_COLORS = {
     "LIVE": (60, 230, 60),
     "STALE": (50, 50, 255),
     "CALIBRATING_STILL": (0, 210, 255),
+    "CALIBRATING_IMU": (0, 210, 255),
     "FULL": (60, 230, 60),
     "IMU_ONLY": (0, 160, 255),
     "CAMERA_ONLY": (200, 160, 40),
