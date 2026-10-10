@@ -118,7 +118,8 @@ python scripts/test_controller_orientation.py --device /dev/ttyACM0 --baud 23040
 ```
 
 The viewer shows labeled LEFT and RIGHT wireframes at fixed positions, colored X/Y/Z
-axes, received quaternion values in `w,x,y,z` order, displayed yaw/pitch/roll, and sample
+axes (+Y is the controller's front), received quaternion values in `w,x,y,z` order,
+displayed yaw/pitch/roll, and sample
 age. Rotation follows the receiver's coordinate convention immediately; no camera,
 startup calibration, or acceleration-based movement is involved. The first controller
 paired after receiver boot is RIGHT (slot 0); the second is LEFT (slot 1).

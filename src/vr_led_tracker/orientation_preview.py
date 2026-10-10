@@ -25,6 +25,10 @@ from .inertial_preview import (
 from .serial_pose import FusionFrameParser, FusionSample
 
 
+# The controller's long dimension and front marker follow its local +Y axis.
+CONTROLLER_VERTICES = BOX_VERTICES[:, [1, 0, 2]]
+
+
 @dataclass
 class ControllerOrientation:
     sample: FusionSample | None = None
@@ -79,15 +83,15 @@ def draw_orientation_panel(
         return image
 
     rotation = controller.displayed_rotation()
-    vertices = (rotation @ BOX_VERTICES.T).T + center
+    vertices = (rotation @ CONTROLLER_VERTICES.T).T + center
     box_color = (255, 155, 65) if label == "LEFT" else (60, 155, 255)
     for first, second in BOX_EDGES:
         _line_3d(image, vertices[first], vertices[second], eye, center, box_color, 2)
-    nose = np.array([[0.08, -0.025, 0.0], [0.125, 0.0, 0.0], [0.08, 0.025, 0.0]])
+    nose = np.array([[-0.025, 0.08, 0.0], [0.0, 0.125, 0.0], [0.025, 0.08, 0.0]])
     nose = (rotation @ nose.T).T + center
     for first, second in ((0, 1), (1, 2), (2, 0)):
         _line_3d(image, nose[first], nose[second], eye, center, box_color, 2)
-    for axis, (name, color) in enumerate(zip("XYZ", AXIS_COLORS)):
+    for axis, (name, color) in enumerate(zip(("X", "+Y front", "Z"), AXIS_COLORS)):
         endpoint = center + rotation[:, axis] * 0.15
         _line_3d(image, center, endpoint, eye, center, color, 2)
         pixel, depth = _project(endpoint[None, :], width, height, eye, center)
@@ -102,7 +106,7 @@ def draw_orientation_panel(
     _put_text(image, f"Received w,x,y,z: {w:+.4f} {x:+.4f} {y:+.4f} {z:+.4f}", (14, bottom))
     _put_text(image, f"Displayed YPR deg: {yaw:+.1f} {pitch:+.1f} {roll:+.1f}", (14, bottom + 25))
     _put_text(image, f"Sample age: {age_ms:.0f} ms  Sequence: {controller.sample.sequence}", (14, bottom + 50))
-    _put_text(image, "Axes: X red | Y green | Z blue", (14, bottom + 75))
+    _put_text(image, "Axes: X red | +Y front green | Z blue", (14, bottom + 75))
     return image
 
 
