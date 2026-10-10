@@ -110,6 +110,28 @@ For serial-only diagnostics:
 vr-led-tracker inertial-preview --device /dev/ttyACM0 --baud 230400
 ```
 
+To test both controllers' quaternion orientations directly, run the standalone viewer
+from the repository root after installing the project:
+
+```bash
+python scripts/test_controller_orientation.py --device /dev/ttyACM0 --baud 230400
+```
+
+The viewer shows labeled LEFT and RIGHT wireframes at fixed positions, colored X/Y/Z
+axes, received quaternion values in `w,x,y,z` order, displayed yaw/pitch/roll, and sample
+age. Rotation follows the receiver's coordinate convention immediately; no camera,
+startup calibration, or acceleration-based movement is involved. The first controller
+paired after receiver boot is RIGHT (slot 0); the second is LEFT (slot 1).
+
+- `R`: recenter each currently live controller; missing or stale controllers are skipped.
+- `C`: clear both recenter references and restore receiver orientation.
+- `Q`, Escape, or closing the window: quit.
+
+Each controller independently shows WAITING until its first valid quaternion, LIVE while
+samples are current, and STALE after 250 ms without a valid sample. A stale controller
+keeps its last orientation. Quaternion readouts always show received values, even after
+recentering. A desktop display is required.
+
 ## Troubleshooting
 
 - **Ball is not detected:** recalibrate its color under the current lighting and inspect the
